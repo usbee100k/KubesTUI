@@ -183,14 +183,24 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
-		remoteUser := os.Getenv("HOMELAB_REMOTE_USER")
+		// Ask for the SSH username instead of silently picking one.
+		// HOMELAB_REMOTE_USER, if set, is offered as the default.
+		defaultUser := strings.TrimSpace(os.Getenv("HOMELAB_REMOTE_USER"))
+
+		userPrompt := "SSH username: "
+		if defaultUser != "" {
+			userPrompt = fmt.Sprintf("SSH username [%s]: ", defaultUser)
+		}
+
+		remoteUser := readRemoteValue(reader, userPrompt)
 
 		if remoteUser == "" {
-			remoteUser = os.Getenv("USER")
+			remoteUser = defaultUser
 		}
 
 		if remoteUser == "" {
-			remoteUser = "root"
+			fmt.Println("SSH username cannot be empty.")
+			return
 		}
 
 		remoteAddr := fmt.Sprintf(
