@@ -486,17 +486,42 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		sourceRoot := filepath.Dir(install)
 
-		// generated/bootstrap travels inside the archive below (only .git and
-		// generated/secrets are excluded). Fail early if it is missing.
-		if info, err := os.Stat(
-			filepath.Join(sourceRoot, "generated", "bootstrap"),
-		); err != nil || !info.IsDir() {
-			fmt.Printf(
-				"[FAIL] Bootstrap package not found: %s\n",
-				filepath.Join(sourceRoot, "generated", "bootstrap"),
-			)
-			fmt.Println("       Bootstrap a control plane first so it is generated.")
-			return
+		// The encrypted join package lives in generated/bootstrap and travels
+		// inside the archive below (only .git and generated/secrets are
+		// excluded). If it is missing locally, offer to fetch it from the
+		// private bootstrap repo HERE, so the worker never needs GitHub access.
+		encName := "worker_join.enc"
+		if remoteScript == "controlplane" {
+			encName = "controlplane_join.enc"
+		}
+
+		bootstrapDir := filepath.Join(sourceRoot, "generated", "bootstrap")
+		encPath := filepath.Join(bootstrapDir, "secrets", encName)
+
+		if _, err := os.Stat(encPath); err != nil {
+			fmt.Printf("[WARN] Encrypted join package not found locally: %s\n", encPath)
+
+			fetch := strings.ToLower(strings.TrimSpace(
+				readRemoteValue(reader, "Fetch it from the bootstrap repository now? [Y/n]: "),
+			))
+
+			if fetch == "" || fetch == "y" {
+				if err := fetchBootstrapPackage(sourceRoot, reader); err != nil {
+					fmt.Printf("[FAIL] Could not fetch bootstrap package: %v\n", err)
+				} else {
+					fmt.Println("[ OK ] Bootstrap package fetched.")
+				}
+			}
+
+			if _, err := os.Stat(encPath); err != nil {
+				fmt.Println("[WARN] The node will not be able to get its join credentials.")
+
+				answer := readRemoteValue(reader, "Continue anyway? [y/N]: ")
+
+				if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+					return
+				}
+			}
 		}
 
 		tarCmd := exec.Command(
@@ -1079,6 +1104,99 @@ func copyFileOverSSH(
 	return session.Run(command)
 }
 
+
+// readEnvFileValue returns NAME from a simple KEY="value" env file ("" if absent).
+func readEnvFileValue(path, name string) string {
+
+	data, err := os.ReadFile(path)
+
+	if err != nil {
+		return ""
+	}
+
+	value := ""
+
+	for _, line := range strings.Split(string(data), "\n") {
+
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
+
+		if strings.HasPrefix(line, name+"=") {
+			value = strings.Trim(strings.TrimPrefix(line, name+"="), "\"' ")
+		}
+	}
+
+	return value
+}
+
+// fetchBootstrapPackage clones the private bootstrap repo with the deploy key
+// (on this machine) and places its contents in generated/bootstrap, which is
+// the same layout upload_bootstrap_package pushes.
+func fetchBootstrapPackage(sourceRoot string, reader *bufio.Reader) error {
+
+	defaults := filepath.Join(sourceRoot, "config", "defaults.env")
+
+	pick := func(name string) string {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+		return readEnvFileValue(defaults, name)
+	}
+
+	repo := pick("BOOTSTRAP_REPO")
+	keyPath := pick("SSH_KEY_PATH")
+
+	if repo == "" {
+		repo = strings.TrimSpace(readRemoteValue(reader, "Bootstrap repository URL: "))
+	}
+
+	if keyPath == "" {
+		keyPath = strings.TrimSpace(readRemoteValue(reader, "Deploy key path (SSH_KEY_PATH): "))
+	}
+
+	if repo == "" || keyPath == "" {
+		return fmt.Errorf("bootstrap repository URL and deploy key path are required")
+	}
+
+	if _, err := os.Stat(keyPath); err != nil {
+		return fmt.Errorf("deploy key not found: %s", keyPath)
+	}
+
+	tmp, err := os.MkdirTemp("", "bootstrap-fetch-")
+
+	if err != nil {
+		return err
+	}
+
+	defer os.RemoveAll(tmp)
+
+	clone := exec.Command("git", "clone", "--depth", "1", repo, tmp)
+
+	clone.Env = append(
+		os.Environ(),
+		"GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "+
+			"-o IdentitiesOnly=yes -i "+shellQuote(keyPath),
+	)
+	clone.Stdout = os.Stdout
+	clone.Stderr = os.Stderr
+
+	if err := clone.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
+	}
+
+	_ = os.RemoveAll(filepath.Join(tmp, ".git"))
+
+	dest := filepath.Join(sourceRoot, "generated", "bootstrap")
+
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return err
+	}
+
+	if out, err := exec.Command("cp", "-a", tmp+"/.", dest+"/").CombinedOutput(); err != nil {
+		return fmt.Errorf("copy failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
 
 // sudoRun runs a shell script as root on the remote host, feeding the sudo
 // password on stdin. It does not rely on a cached sudo timestamp (which does
