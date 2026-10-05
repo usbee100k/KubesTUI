@@ -120,12 +120,21 @@ var operations = []operation{
 
 const toggleTitle = "Toggle Dry-Run / Live"
 
+// notice leaves the TUI, prints a message, and waits for Enter so the message
+// is not wiped when the TUI redraws.
+func notice(app *tview.Application, msg string) {
+	app.Suspend(func() {
+		fmt.Printf("\n%s\n\nPress Enter to return to KubesTUI...", msg)
+		_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
+	})
+}
+
 func runRemoteOperation(app *tview.Application, op operation) {
 
 	install := installerPath()
 
 	if install == "" {
-		fmt.Println("HOMELABCD_INSTALL is not set.")
+		notice(app, "HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.")
 		return
 	}
 
@@ -139,13 +148,23 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		remoteScript = "controlplane"
 
 	default:
-		fmt.Printf("Unsupported remote operation: %s\n", op.Op)
+		notice(app, "Unsupported remote operation: "+op.Op)
 		return
 	}
 
 	app.Suspend(func() {
 
 		reader := bufio.NewReader(os.Stdin)
+
+		// Pause on any failure before the remote session starts, otherwise the
+		// TUI redraws immediately and the error text disappears.
+		ranRemote := false
+		defer func() {
+			if !ranRemote {
+				fmt.Print("\nPress Enter to return to KubesTUI...")
+				_, _ = reader.ReadString('\n')
+			}
+		}()
 
 		fmt.Println()
 		fmt.Println("==================================================")
@@ -192,7 +211,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			"ssh-keyscan",
 			"-T", "10",
 			"-t",
-			"ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
+			"ed25519,ecdsa,rsa",
 			remoteHost,
 		)
 
@@ -668,8 +687,12 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
-		termWidth := 120
-		termHeight := 40
+		fd := int(os.Stdin.Fd())
+
+		termWidth, termHeight := 120, 40
+		if w, h, err := term.GetSize(fd); err == nil && w > 0 && h > 0 {
+			termWidth, termHeight = w, h
+		}
 
 		modes := ssh.TerminalModes{
 			ssh.ECHO:          1,
@@ -698,6 +721,8 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
+		ranRemote = true
+
 		runSession.Stdin = os.Stdin
 		runSession.Stdout = os.Stdout
 		runSession.Stderr = os.Stderr
@@ -711,9 +736,15 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			remoteScript,
 		)
 
-		if err := runSession.Run(
-			remoteCommand,
-		); err != nil {
+		restore := func() {}
+		if oldState, err := term.MakeRaw(fd); err == nil {
+			restore = func() { _ = term.Restore(fd, oldState) }
+		}
+
+		runErr := runSession.Run(remoteCommand)
+		restore()
+
+		if err := runErr; err != nil {
 
 			fmt.Printf(
 				"\n[FAIL] Remote %s operation failed: %v\n",
@@ -768,6 +799,7 @@ func getSSHHostFingerprint(
 		User: user,
 		HostKeyCallback: func(
 			hostname string,
+			remote net.Addr,
 			key ssh.PublicKey,
 		) error {
 
