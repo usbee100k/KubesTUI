@@ -11,7 +11,9 @@ import (
 	"time"
 	"os/exec"
 	osuser "os/user"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
@@ -482,6 +484,33 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Println()
 
 
+		// Workers: offer to create a fresh join token on a control plane, so no
+		// stored (possibly expired) join package or GitHub access is needed.
+		joinCmd := ""
+
+		if remoteScript == "worker" {
+
+			gen := strings.ToLower(strings.TrimSpace(readRemoteValue(
+				reader,
+				"Generate a fresh join token from a control plane now? [Y/n]: ",
+			)))
+
+			if gen == "" || gen == "y" || gen == "yes" {
+
+				cmd, gerr := generateJoinCommand(reader, remoteUser, password)
+
+				if gerr != nil {
+					fmt.Printf("[FAIL] Could not generate join token: %v\n", gerr)
+					return
+				}
+
+				joinCmd = cmd
+
+				fmt.Println("[ OK ] Fresh join token generated (valid 2 hours).")
+				fmt.Println()
+			}
+		}
+
 		fmt.Println("[INFO] Copying homelabCD...")
 
 		sourceRoot := filepath.Dir(install)
@@ -498,7 +527,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		bootstrapDir := filepath.Join(sourceRoot, "generated", "bootstrap")
 		encPath := filepath.Join(bootstrapDir, "secrets", encName)
 
-		if _, err := os.Stat(encPath); err != nil {
+		if _, err := os.Stat(encPath); err != nil && joinCmd == "" {
 			fmt.Printf("[WARN] Encrypted join package not found locally: %s\n", encPath)
 
 			fetch := strings.ToLower(strings.TrimSpace(
@@ -508,6 +537,9 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			if fetch == "" || fetch == "y" {
 				if err := fetchBootstrapPackage(sourceRoot, reader); err != nil {
 					fmt.Printf("[FAIL] Could not fetch bootstrap package: %v\n", err)
+				} else if _, serr := os.Stat(encPath); serr != nil {
+					fmt.Printf("[WARN] Repository cloned, but it has no secrets/%s.\n", encName)
+					fmt.Println("       Bootstrap a control plane first (it uploads the package).")
 				} else {
 					fmt.Println("[ OK ] Bootstrap package fetched.")
 				}
@@ -617,6 +649,30 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		)
 		fmt.Println()
 
+
+		if joinCmd != "" {
+
+			fmt.Println("[INFO] Installing fresh join command on the node...")
+
+			script := "#!/usr/bin/env bash\nset -euo pipefail\n" + joinCmd + "\n"
+
+			if err := uploadViaTmp(
+				client,
+				password,
+				script,
+				"/tmp/homelab-worker-join.sh",
+				remoteRoot+"/generated/secrets",
+				"worker_join.sh",
+				"700",
+			); err != nil {
+				fmt.Printf("[FAIL] Could not install join command: %v\n", err)
+				return
+			}
+
+			fmt.Println("[ OK ] Join command installed.")
+			fmt.Println()
+
+		} else {
 
 		ageKey := ""
 		candidates := ageKeyCandidates()
@@ -729,6 +785,8 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Println("[ OK ] AGE private key installed.")
 		fmt.Println()
 
+		}
+
 		fmt.Printf(
 			"[INFO] Executing %s on %s...\n",
 			remoteScript,
@@ -796,12 +854,18 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		runSession.Stdout = os.Stdout
 		runSession.Stderr = os.Stderr
 
+		joinEnv := ""
+		if joinCmd != "" {
+			joinEnv = "HOMELAB_JOIN_PROVIDED=true "
+		}
+
 		remoteCommand := fmt.Sprintf(
 			"sudo -S -p '' -v && stty echo && "+
 				"sudo -n env HOME=/root "+
-				"HOMELAB_REMOTE_MODE=true "+
+				"HOMELAB_REMOTE_MODE=true %s"+
 				"BOOTSTRAP_PACKAGE_DIR=%s/generated/bootstrap "+
 				"bash %s/install.sh --run %s",
+			joinEnv,
 			remoteRoot,
 			remoteRoot,
 			remoteScript,
@@ -1128,29 +1192,195 @@ func readEnvFileValue(path, name string) string {
 	return value
 }
 
+// configValue looks for NAME in the environment, then in config/*.env.
+func configValue(sourceRoot, name string) string {
+
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+
+	files, _ := filepath.Glob(filepath.Join(sourceRoot, "config", "*.env"))
+
+	for _, f := range files {
+		if v := readEnvFileValue(f, name); v != "" {
+			return v
+		}
+	}
+
+	return ""
+}
+
+// yamlConfigValue looks for a simple "key: value" line in config/ and generated/ YAML files.
+func yamlConfigValue(sourceRoot string, keys ...string) string {
+
+	var files []string
+
+	for _, dir := range []string{"config", "generated"} {
+		m, _ := filepath.Glob(filepath.Join(sourceRoot, dir, "*.y*ml"))
+		files = append(files, m...)
+	}
+
+	for _, f := range files {
+
+		data, err := os.ReadFile(f)
+
+		if err != nil {
+			continue
+		}
+
+		for _, line := range strings.Split(string(data), "\n") {
+
+			line = strings.TrimSpace(line)
+
+			for _, k := range keys {
+
+				if !strings.HasPrefix(line, k+":") {
+					continue
+				}
+
+				v := strings.Trim(
+					strings.TrimSpace(strings.TrimPrefix(line, k+":")),
+					"\"' ",
+				)
+
+				if v != "" && v != "null" {
+					return v
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func isPrivateKeyFile(path string) bool {
+
+	data, err := os.ReadFile(path)
+
+	if err != nil || len(data) == 0 {
+		return false
+	}
+
+	if len(data) > 400 {
+		data = data[:400]
+	}
+
+	return strings.Contains(string(data), "PRIVATE KEY")
+}
+
+// findDeployKeys lists likely SSH private keys on this machine.
+func findDeployKeys(sourceRoot string) []string {
+
+	var dirs []string
+
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".ssh"))
+	}
+
+	if su := strings.TrimSpace(os.Getenv("SUDO_USER")); su != "" {
+		if u, err := osuser.Lookup(su); err == nil {
+			dirs = append(dirs, filepath.Join(u.HomeDir, ".ssh"))
+		}
+	}
+
+	dirs = append(
+		dirs,
+		filepath.Join(sourceRoot, "generated"),
+		filepath.Join(sourceRoot, "generated", "ssh"),
+		filepath.Join(sourceRoot, "config"),
+	)
+
+	seen := map[string]bool{}
+
+	var found []string
+
+	for _, dir := range dirs {
+
+		entries, err := os.ReadDir(dir)
+
+		if err != nil {
+			continue
+		}
+
+		for _, e := range entries {
+
+			if e.IsDir() || strings.HasSuffix(e.Name(), ".pub") {
+				continue
+			}
+
+			path := filepath.Join(dir, e.Name())
+
+			if seen[path] || !isPrivateKeyFile(path) {
+				continue
+			}
+
+			seen[path] = true
+			found = append(found, path)
+		}
+	}
+
+	return found
+}
+
 // fetchBootstrapPackage clones the private bootstrap repo with the deploy key
 // (on this machine) and places its contents in generated/bootstrap, which is
 // the same layout upload_bootstrap_package pushes.
 func fetchBootstrapPackage(sourceRoot string, reader *bufio.Reader) error {
 
-	defaults := filepath.Join(sourceRoot, "config", "defaults.env")
-
-	pick := func(name string) string {
-		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-			return v
-		}
-		return readEnvFileValue(defaults, name)
-	}
-
-	repo := pick("BOOTSTRAP_REPO")
-	keyPath := pick("SSH_KEY_PATH")
+	// Find the values the project already saved instead of asking for them.
+	repo := configValue(sourceRoot, "BOOTSTRAP_REPO")
 
 	if repo == "" {
+		repo = yamlConfigValue(sourceRoot, "bootstrap_repo")
+	}
+
+	keyPath := configValue(sourceRoot, "SSH_KEY_PATH")
+
+	if keyPath == "" {
+		keyPath = yamlConfigValue(sourceRoot, "ssh_key_path", "deploy_key_path", "deploy_key")
+	}
+
+	if repo != "" {
+		fmt.Printf("[INFO] Bootstrap repository: %s\n", repo)
+	}
+
+	if keyPath != "" {
+		fmt.Printf("[INFO] Deploy key: %s\n", keyPath)
+	}
+
+	if repo == "" {
+		fmt.Println()
+		fmt.Println("Enter the private bootstrap repository URL,")
+		fmt.Println("for example: git@github.com:user/bootstrap-repo.git")
 		repo = strings.TrimSpace(readRemoteValue(reader, "Bootstrap repository URL: "))
 	}
 
 	if keyPath == "" {
-		keyPath = strings.TrimSpace(readRemoteValue(reader, "Deploy key path (SSH_KEY_PATH): "))
+		keys := findDeployKeys(sourceRoot)
+
+		fmt.Println()
+		fmt.Println("Enter the path of the SSH deploy key that has access to the repository.")
+
+		if len(keys) > 0 {
+			fmt.Println("Private keys found on this machine:")
+			for i, k := range keys {
+				fmt.Printf("  %d) %s\n", i+1, k)
+			}
+		}
+
+		choice := strings.TrimSpace(readRemoteValue(reader, "Key number or full path: "))
+
+		if n, err := strconv.Atoi(choice); err == nil && n >= 1 && n <= len(keys) {
+			keyPath = keys[n-1]
+		} else {
+			keyPath = choice
+		}
+	}
+
+	if strings.HasPrefix(keyPath, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			keyPath = filepath.Join(home, keyPath[2:])
+		}
 	}
 
 	if repo == "" || keyPath == "" {
@@ -1193,6 +1423,275 @@ func fetchBootstrapPackage(sourceRoot string, reader *bufio.Reader) error {
 
 	if out, err := exec.Command("cp", "-a", tmp+"/.", dest+"/").CombinedOutput(); err != nil {
 		return fmt.Errorf("copy failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
+var joinCommandPattern = regexp.MustCompile(
+	`^kubeadm join [A-Za-z0-9.:\[\]-]+ --token [a-z0-9.]+ ` +
+		`--discovery-token-ca-cert-hash sha256:[a-f0-9]{64}$`,
+)
+
+// parseJoinCommand extracts and validates the "kubeadm join ..." line from the
+// output of "kubeadm token create --print-join-command". kubeadm prints it
+// split over two lines with a trailing backslash, so those are joined first.
+func parseJoinCommand(output string) (string, error) {
+
+	text := strings.ReplaceAll(output, "\\\n", " ")
+
+	for _, line := range strings.Split(text, "\n") {
+
+		line = strings.Join(strings.Fields(line), " ")
+
+		if !strings.HasPrefix(line, "kubeadm join ") {
+			continue
+		}
+
+		if !joinCommandPattern.MatchString(line) {
+			return "", fmt.Errorf("unexpected join command format: %s", line)
+		}
+
+		return line, nil
+	}
+
+	return "", fmt.Errorf("no join command found in output: %s", strings.TrimSpace(output))
+}
+
+func promptPassword(prompt string) (string, error) {
+
+	fmt.Print(prompt)
+
+	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+
+	fmt.Println()
+
+	return string(b), err
+}
+
+// trustAndDial shows the host's SSH key fingerprints, asks the user to trust
+// them, then connects with a password.
+func trustAndDial(
+	reader *bufio.Reader,
+	host, user, password string,
+) (*ssh.Client, error) {
+
+	raw, err := exec.Command(
+		"ssh-keyscan", "-T", "10", "-t", "ed25519,ecdsa,rsa", host,
+	).Output()
+
+	if err != nil || len(raw) == 0 {
+		return nil, fmt.Errorf("could not read SSH host keys from %s", host)
+	}
+
+	trusted := map[string]bool{}
+
+	var fingerprints []string
+
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+
+		fields := strings.Fields(strings.TrimSpace(line))
+
+		if len(fields) < 3 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+
+		key, _, _, _, perr := ssh.ParseAuthorizedKey(
+			[]byte(fields[1] + " " + fields[2]),
+		)
+
+		if perr != nil || trusted[string(key.Marshal())] {
+			continue
+		}
+
+		trusted[string(key.Marshal())] = true
+
+		fingerprints = append(
+			fingerprints,
+			fmt.Sprintf("%-22s %s", key.Type(), ssh.FingerprintSHA256(key)),
+		)
+	}
+
+	if len(trusted) == 0 {
+		return nil, fmt.Errorf("could not parse SSH host keys from %s", host)
+	}
+
+	fmt.Printf("\nHost: %s\n", host)
+
+	for _, fp := range fingerprints {
+		fmt.Printf("  %s\n", fp)
+	}
+
+	fmt.Println()
+
+	answer := strings.ToLower(strings.TrimSpace(
+		readRemoteValue(reader, "Trust this host fingerprint? [y/N]: "),
+	))
+
+	if answer != "y" && answer != "yes" {
+		return nil, fmt.Errorf("host fingerprint not trusted")
+	}
+
+	return ssh.Dial(
+		"tcp",
+		net.JoinHostPort(host, "22"),
+		&ssh.ClientConfig{
+			User: user,
+			Auth: []ssh.AuthMethod{ssh.Password(password)},
+			HostKeyCallback: func(
+				hostname string,
+				remote net.Addr,
+				key ssh.PublicKey,
+			) error {
+				if trusted[string(key.Marshal())] {
+					return nil
+				}
+				return fmt.Errorf(
+					"host key mismatch: server presented %s %s",
+					key.Type(),
+					ssh.FingerprintSHA256(key),
+				)
+			},
+			Timeout: 10 * time.Second,
+		},
+	)
+}
+
+// generateJoinCommand creates a fresh, short-lived bootstrap token on a
+// control plane and returns the validated "kubeadm join ..." command.
+func generateJoinCommand(
+	reader *bufio.Reader,
+	defaultUser, defaultPassword string,
+) (string, error) {
+
+	const tokenCmd = "kubeadm token create --ttl 2h --print-join-command"
+
+	host := strings.TrimSpace(readRemoteValue(
+		reader,
+		"Control plane address (blank = this machine): ",
+	))
+
+	var output string
+
+	if host == "" {
+
+		fmt.Println("[INFO] Creating join token on this machine...")
+
+		cmd := exec.Command(
+			"sudo", "kubeadm", "token", "create",
+			"--ttl", "2h", "--print-join-command",
+		)
+		cmd.Stdin = os.Stdin
+		cmd.Stderr = os.Stderr
+
+		raw, err := cmd.Output()
+
+		if err != nil {
+			return "", fmt.Errorf("%v (is kubeadm installed on a control plane here?)", err)
+		}
+
+		output = string(raw)
+
+	} else {
+
+		user := strings.TrimSpace(readRemoteValue(
+			reader,
+			fmt.Sprintf("Control plane SSH user [%s]: ", defaultUser),
+		))
+
+		if user == "" {
+			user = defaultUser
+		}
+
+		password := defaultPassword
+
+		reuse := strings.ToLower(strings.TrimSpace(readRemoteValue(
+			reader,
+			"Use the same password as the worker? [Y/n]: ",
+		)))
+
+		if reuse == "n" || reuse == "no" {
+
+			pw, err := promptPassword(
+				fmt.Sprintf("SSH password for %s@%s: ", user, host),
+			)
+
+			if err != nil || pw == "" {
+				return "", fmt.Errorf("could not read password")
+			}
+
+			password = pw
+		}
+
+		client, err := trustAndDial(reader, host, user, password)
+
+		if err != nil {
+			return "", err
+		}
+
+		defer client.Close()
+
+		fmt.Println("[INFO] Creating join token on the control plane...")
+
+		out, err := sudoRun(client, password, tokenCmd)
+
+		if err != nil {
+			return "", fmt.Errorf("%v: %s", err, out)
+		}
+
+		output = out
+	}
+
+	return parseJoinCommand(output)
+}
+
+// uploadViaTmp writes content to a temp file as the SSH user, then installs it
+// as root at destDir/destName with the given mode.
+func uploadViaTmp(
+	client *ssh.Client,
+	password, content, tmpPath, destDir, destName, mode string,
+) error {
+
+	session, err := client.NewSession()
+
+	if err != nil {
+		return err
+	}
+
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+
+	if err != nil {
+		return err
+	}
+
+	if err := session.Start("umask 077; cat > " + shellQuote(tmpPath)); err != nil {
+		return err
+	}
+
+	_, _ = io.WriteString(stdin, content)
+	_ = stdin.Close()
+
+	if err := session.Wait(); err != nil {
+		return err
+	}
+
+	out, err := sudoRun(
+		client,
+		password,
+		fmt.Sprintf(
+			"mkdir -p %s && install -m %s %s %s && rm -f %s",
+			shellQuote(destDir),
+			mode,
+			shellQuote(tmpPath),
+			shellQuote(path.Join(destDir, destName)),
+			shellQuote(tmpPath),
+		),
+	)
+
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, out)
 	}
 
 	return nil
