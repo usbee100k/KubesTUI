@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -62,6 +63,22 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Remote Join Control Plane",
+		Desc:  "SSH to another node and execute controlplane.sh remotely.",
+		Op:    "remote-controlplane",
+		Commands: []string{
+			"SSH → remote node → ${HOMELABCD_INSTALL} --run controlplane",
+		},
+	},
+	{
+		Title: "Remote Join Worker",
+		Desc:  "SSH to another node and execute worker.sh remotely.",
+		Op:    "remote-worker",
+		Commands: []string{
+			"SSH → remote node → ${HOMELABCD_INSTALL} --run worker",
+		},
+	},
+	{
 		Title: "Repair Existing Node",
 		Desc:  "Restart containerd/kubelet and show node status.",
 		Op:    "repair",
@@ -96,6 +113,468 @@ var operations = []operation{
 }
 
 const toggleTitle = "Toggle Dry-Run / Live"
+
+func runRemoteOperation(app *tview.Application, op operation) {
+
+	install := installerPath()
+
+	if install == "" {
+		fmt.Println("HOMELABCD_INSTALL is not set.")
+		return
+	}
+
+	remoteScript := ""
+
+	switch op.Op {
+	case "remote-worker":
+		remoteScript = "worker"
+
+	case "remote-controlplane":
+		remoteScript = "controlplane"
+
+	default:
+		fmt.Printf("Unsupported remote operation: %s\n", op.Op)
+		return
+	}
+
+	app.Suspend(func() {
+
+		reader := bufio.NewReader(os.Stdin)
+
+		fmt.Println()
+		fmt.Println("==================================================")
+		fmt.Println("             REMOTE NODE EXECUTION")
+		fmt.Println("==================================================")
+		fmt.Println()
+
+		remoteHost := readRemoteValue(
+			reader,
+			"Remote host/IP: ",
+		)
+
+		if remoteHost == "" {
+			fmt.Println("Remote host cannot be empty.")
+			return
+		}
+
+		remoteUser := readRemoteValue(
+			reader,
+			"SSH username: ",
+		)
+
+		if remoteUser == "" {
+			fmt.Println("SSH username cannot be empty.")
+			return
+		}
+
+		remotePort := readRemoteValue(
+			reader,
+			"SSH port [22]: ",
+		)
+
+		if remotePort == "" {
+			remotePort = "22"
+		}
+
+		defaultKey := filepath.Join(
+			os.Getenv("HOME"),
+			".ssh",
+			"id_ed25519",
+		)
+
+		remoteKey := readRemoteValue(
+			reader,
+			fmt.Sprintf("SSH key [%s]: ", defaultKey),
+		)
+
+		if remoteKey == "" {
+			remoteKey = defaultKey
+		}
+
+		if _, err := os.Stat(remoteKey); err != nil {
+			fmt.Printf(
+				"SSH key not found: %s\n",
+				remoteKey,
+			)
+			return
+		}
+
+		localHome, err := os.UserHomeDir()
+
+		if err != nil {
+			fmt.Printf(
+				"[FAIL] Could not determine local home directory: %v\n",
+				err,
+			)
+			return
+		}
+
+		ageKey := filepath.Join(
+			localHome,
+			".config",
+			"sops",
+			"age",
+			"keys.txt",
+		)
+
+		if _, err := os.Stat(ageKey); err != nil {
+			fmt.Println()
+			fmt.Println("[FAIL] AGE private key not found:")
+			fmt.Println(ageKey)
+			fmt.Println()
+			fmt.Println(
+				"The bootstrap node must have the AGE key used to decrypt",
+			)
+			fmt.Println(
+				"the encrypted worker/control-plane join credentials.",
+			)
+			return
+		}
+
+		sourceRoot := filepath.Dir(install)
+
+		localBootstrapPackage := filepath.Join(
+			sourceRoot,
+			"generated",
+			"bootstrap",
+			"secrets",
+		)
+
+		encryptedJoin := ""
+
+		switch remoteScript {
+
+		case "worker":
+			encryptedJoin = filepath.Join(
+				localBootstrapPackage,
+				"worker_join.enc",
+			)
+
+		case "controlplane":
+			encryptedJoin = filepath.Join(
+				localBootstrapPackage,
+				"controlplane_join.enc",
+			)
+		}
+
+		if _, err := os.Stat(encryptedJoin); err != nil {
+			fmt.Println()
+			fmt.Printf(
+				"[FAIL] Missing encrypted %s join package:\n",
+				remoteScript,
+			)
+			fmt.Println(encryptedJoin)
+			fmt.Println()
+			fmt.Println(
+				"Run the bootstrap-package step before using remote node execution.",
+			)
+			return
+		}
+
+		fmt.Println()
+		fmt.Printf(
+			"Target      : %s@%s:%s\n",
+			remoteUser,
+			remoteHost,
+			remotePort,
+		)
+		fmt.Printf(
+			"Operation   : %s\n",
+			remoteScript,
+		)
+		fmt.Printf(
+			"SSH key     : %s\n",
+			remoteKey,
+		)
+		fmt.Println()
+
+		fmt.Println("[INFO] Testing SSH connection...")
+
+		sshTest := exec.Command(
+			"ssh",
+			"-p", remotePort,
+			"-i", remoteKey,
+			"-o", "BatchMode=yes",
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "ConnectTimeout=10",
+			"-o", "IdentitiesOnly=yes",
+			fmt.Sprintf(
+				"%s@%s",
+				remoteUser,
+				remoteHost,
+			),
+			"echo connected",
+		)
+
+		sshTest.Stdout = os.Stdout
+		sshTest.Stderr = os.Stderr
+
+		if err := sshTest.Run(); err != nil {
+			fmt.Printf(
+				"[FAIL] SSH connection failed: %v\n",
+				err,
+			)
+			return
+		}
+
+		fmt.Println("[ OK ] SSH connection successful.")
+		fmt.Println()
+
+		remoteRoot := "/opt/homelabCD"
+
+		fmt.Println("[INFO] Preparing remote directory...")
+
+		prepare := exec.Command(
+			"ssh",
+			"-t",
+			"-p", remotePort,
+			"-i", remoteKey,
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "IdentitiesOnly=yes",
+			fmt.Sprintf(
+				"%s@%s",
+				remoteUser,
+				remoteHost,
+			),
+			fmt.Sprintf(
+				"sudo mkdir -p %s && sudo chown %s:%s %s",
+				remoteRoot,
+				remoteUser,
+				remoteUser,
+				remoteRoot,
+			),
+		)
+
+		prepare.Stdin = os.Stdin
+		prepare.Stdout = os.Stdout
+		prepare.Stderr = os.Stderr
+
+		if err := prepare.Run(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not prepare remote directory: %v\n",
+				err,
+			)
+			return
+		}
+
+		fmt.Println("[ OK ] Remote directory ready.")
+		fmt.Println()
+
+		fmt.Println("[INFO] Copying homelabCD to remote node...")
+
+		tarCmd := exec.Command(
+			"tar",
+			"--exclude=.git",
+			"--exclude=generated/secrets",
+			"-C",
+			sourceRoot,
+			"-czf",
+			"-",
+			".",
+		)
+
+		sshCmd := exec.Command(
+			"ssh",
+			"-p", remotePort,
+			"-i", remoteKey,
+			"-o", "BatchMode=yes",
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "IdentitiesOnly=yes",
+			fmt.Sprintf(
+				"%s@%s",
+				remoteUser,
+				remoteHost,
+			),
+			fmt.Sprintf(
+				"tar -xzf - -C %s",
+				remoteRoot,
+			),
+		)
+
+		pipe, err := tarCmd.StdoutPipe()
+
+		if err != nil {
+			fmt.Printf(
+				"[FAIL] Could not create archive pipe: %v\n",
+				err,
+			)
+			return
+		}
+
+		sshCmd.Stdin = pipe
+		sshCmd.Stdout = os.Stdout
+		sshCmd.Stderr = os.Stderr
+
+		if err := tarCmd.Start(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not start archive: %v\n",
+				err,
+			)
+			return
+		}
+
+		if err := sshCmd.Start(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not start remote transfer: %v\n",
+				err,
+			)
+
+			_ = tarCmd.Process.Kill()
+
+			return
+		}
+
+		if err := tarCmd.Wait(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not archive homelabCD: %v\n",
+				err,
+			)
+			return
+		}
+
+		if err := sshCmd.Wait(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not copy homelabCD: %v\n",
+				err,
+			)
+			return
+		}
+
+		fmt.Println(
+			"[ OK ] homelabCD copied to remote node.",
+		)
+		fmt.Println()
+
+		fmt.Println("[INFO] Copying AGE private key...")
+
+		remoteAgeTemp := "/tmp/homelab-age-keys.txt"
+
+		scpAge := exec.Command(
+			"scp",
+			"-P", remotePort,
+			"-i", remoteKey,
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "IdentitiesOnly=yes",
+			ageKey,
+			fmt.Sprintf(
+				"%s@%s:%s",
+				remoteUser,
+				remoteHost,
+				remoteAgeTemp,
+			),
+		)
+
+		scpAge.Stdout = os.Stdout
+		scpAge.Stderr = os.Stderr
+
+		if err := scpAge.Run(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not copy AGE private key: %v\n",
+				err,
+			)
+			return
+		}
+
+		installAge := exec.Command(
+			"ssh",
+			"-t",
+			"-p", remotePort,
+			"-i", remoteKey,
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "IdentitiesOnly=yes",
+			fmt.Sprintf(
+				"%s@%s",
+				remoteUser,
+				remoteHost,
+			),
+			"sudo mkdir -p /root/.config/sops/age && " +
+				"sudo install -m 600 " +
+				remoteAgeTemp +
+				" /root/.config/sops/age/keys.txt && " +
+				"rm -f " +
+				remoteAgeTemp,
+		)
+
+		installAge.Stdin = os.Stdin
+		installAge.Stdout = os.Stdout
+		installAge.Stderr = os.Stderr
+
+		if err := installAge.Run(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not install AGE private key: %v\n",
+				err,
+			)
+			return
+		}
+
+		fmt.Println("[ OK ] AGE private key installed.")
+		fmt.Println()
+
+		fmt.Printf(
+			"[INFO] Executing %s operation on %s...\n",
+			remoteScript,
+			remoteHost,
+		)
+
+		remoteInstall := fmt.Sprintf(
+			"sudo env HOME=/root BOOTSTRAP_PACKAGE_DIR=%s/generated/bootstrap bash %s/install.sh --run %s",
+			remoteRoot,
+			remoteRoot,
+			remoteScript,
+		)
+
+		remoteExec := exec.Command(
+			"ssh",
+			"-t",
+			"-p", remotePort,
+			"-i", remoteKey,
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "IdentitiesOnly=yes",
+			fmt.Sprintf(
+				"%s@%s",
+				remoteUser,
+				remoteHost,
+			),
+			remoteInstall,
+		)
+
+		remoteExec.Stdin = os.Stdin
+		remoteExec.Stdout = os.Stdout
+		remoteExec.Stderr = os.Stderr
+
+		if err := remoteExec.Run(); err != nil {
+			fmt.Printf(
+				"\n[FAIL] Remote %s operation failed: %v\n",
+				remoteScript,
+				err,
+			)
+			return
+		}
+
+		fmt.Printf(
+			"\n[ OK ] Remote %s operation completed.\n",
+			remoteScript,
+		)
+	})
+
+	fmt.Print(
+		"\nPress Enter to return to KubesTUI...",
+	)
+
+	_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
+}
+
+func readRemoteValue(reader *bufio.Reader, prompt string) string {
+
+	fmt.Print(prompt)
+
+	value, err := reader.ReadString('\n')
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(value)
+}
 
 // ---------------------------------------------------------------------------
 // UI
@@ -199,22 +678,49 @@ func footerText(page string) string {
 }
 
 func runOperation(app *tview.Application, op operation) {
+
+	if strings.HasPrefix(op.Op, "remote-") {
+		runRemoteOperation(app, op)
+		return
+	}
+
 	install := installerPath()
+
 	app.Suspend(func() {
+
 		fmt.Printf("\n=== %s ===\n\n", op.Title)
+
 		if install == "" {
-			fmt.Println("HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.")
+
+			fmt.Println(
+				"HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.",
+			)
+
 		} else {
-			cmd := exec.Command("bash", install, "--run", op.Op)
+
+			cmd := exec.Command(
+				"bash",
+				install,
+				"--run",
+				op.Op,
+			)
+
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			cmd.Env = os.Environ()
+
 			if err := cmd.Run(); err != nil {
-				fmt.Printf("\n[FAIL] %s: %v\n", op.Op, err)
+				fmt.Printf(
+					"\n[FAIL] %s: %v\n",
+					op.Op,
+					err,
+				)
 			}
 		}
+
 		fmt.Print("\nPress Enter to return to KubesTUI...")
+
 		_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
 	})
 }
