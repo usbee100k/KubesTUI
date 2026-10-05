@@ -486,6 +486,19 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		sourceRoot := filepath.Dir(install)
 
+		// generated/bootstrap travels inside the archive below (only .git and
+		// generated/secrets are excluded). Fail early if it is missing.
+		if info, err := os.Stat(
+			filepath.Join(sourceRoot, "generated", "bootstrap"),
+		); err != nil || !info.IsDir() {
+			fmt.Printf(
+				"[FAIL] Bootstrap package not found: %s\n",
+				filepath.Join(sourceRoot, "generated", "bootstrap"),
+			)
+			fmt.Println("       Bootstrap a control plane first so it is generated.")
+			return
+		}
+
 		tarCmd := exec.Command(
 			"tar",
 			"--exclude=.git",
@@ -761,6 +774,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		remoteCommand := fmt.Sprintf(
 			"sudo -S -p '' -v && stty echo && "+
 				"sudo -n env HOME=/root "+
+				"HOMELAB_REMOTE_MODE=true "+
 				"BOOTSTRAP_PACKAGE_DIR=%s/generated/bootstrap "+
 				"bash %s/install.sh --run %s",
 			remoteRoot,
