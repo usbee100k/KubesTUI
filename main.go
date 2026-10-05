@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 	"os/exec"
+	osuser "os/user"
 	"path/filepath"
 	"strings"
 
@@ -569,31 +570,26 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Println()
 
 
-		localHome, err := os.UserHomeDir()
+		ageKey := ""
+		candidates := ageKeyCandidates()
 
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not determine local home directory: %v\n",
-				err,
-			)
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				ageKey = c
+				break
+			}
+		}
+
+		if ageKey == "" {
+			fmt.Println("[FAIL] AGE key not found. Looked in:")
+			for _, c := range candidates {
+				fmt.Printf("         %s\n", c)
+			}
+			fmt.Println("       Set SOPS_AGE_KEY_FILE to the key's path and try again.")
 			return
 		}
 
-		ageKey := filepath.Join(
-			localHome,
-			".config",
-			"sops",
-			"age",
-			"keys.txt",
-		)
-
-		if _, err := os.Stat(ageKey); err != nil {
-			fmt.Printf(
-				"[FAIL] AGE key not found: %s\n",
-				ageKey,
-			)
-			return
-		}
+		fmt.Printf("[INFO] Using AGE key: %s\n", ageKey)
 
 		ageData, err := os.ReadFile(ageKey)
 
@@ -1100,6 +1096,40 @@ func sudoRun(
 	err = session.Wait()
 
 	return strings.TrimSpace(out.String()), err
+}
+
+// ageKeyCandidates lists where the local AGE key may live. When the TUI is
+// started through "sudo ./install.sh", HOME is /root, so the invoking user's
+// home (SUDO_USER) must be checked too.
+func ageKeyCandidates() []string {
+
+	var paths []string
+
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		for _, existing := range paths {
+			if existing == p {
+				return
+			}
+		}
+		paths = append(paths, p)
+	}
+
+	add(strings.TrimSpace(os.Getenv("SOPS_AGE_KEY_FILE")))
+
+	if home, err := os.UserHomeDir(); err == nil {
+		add(filepath.Join(home, ".config", "sops", "age", "keys.txt"))
+	}
+
+	if su := strings.TrimSpace(os.Getenv("SUDO_USER")); su != "" {
+		if u, err := osuser.Lookup(su); err == nil {
+			add(filepath.Join(u.HomeDir, ".config", "sops", "age", "keys.txt"))
+		}
+	}
+
+	return paths
 }
 
 func shellQuote(value string) string {
