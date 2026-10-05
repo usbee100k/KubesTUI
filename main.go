@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"io"
@@ -458,38 +459,23 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		fmt.Println("[INFO] Preparing remote directory...")
 
-		prepareSession, err := client.NewSession()
-
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not create remote session: %v\n",
-				err,
-			)
-			return
-		}
-
-		prepareCmd := fmt.Sprintf(
-			"sudo -n mkdir -p %s && "+
-				"sudo -n chown %s:%s %s",
-			remoteRoot,
-			remoteUser,
-			remoteUser,
-			remoteRoot,
-		)
-
-		if err := prepareSession.Run(
-			prepareCmd,
+		if out, err := sudoRun(
+			client,
+			password,
+			fmt.Sprintf(
+				"mkdir -p %s && chown %s: %s",
+				shellQuote(remoteRoot),
+				shellQuote(remoteUser),
+				shellQuote(remoteRoot),
+			),
 		); err != nil {
-			prepareSession.Close()
-
 			fmt.Printf(
-				"[FAIL] Could not prepare remote directory: %v\n",
+				"[FAIL] Could not prepare remote directory: %v\n%s\n",
 				err,
+				out,
 			)
 			return
 		}
-
-		prepareSession.Close()
 
 		fmt.Println("[ OK ] Remote directory ready.")
 		fmt.Println()
@@ -647,7 +633,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		ageSession.Stderr = os.Stderr
 
 		if err := ageSession.Start(
-			"cat > /tmp/homelab-age-keys.txt",
+			"umask 077; cat > /tmp/homelab-age-keys.txt",
 		); err != nil {
 			ageSession.Close()
 
@@ -680,36 +666,21 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		
 
-		ageInstall, err := client.NewSession()
-
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not create AGE install session: %v\n",
-				err,
-			)
-			return
-		}
-
-		ageInstallCmd :=
-			"sudo -n mkdir -p /root/.config/sops/age && " +
-				"sudo -n install -m 600 " +
-				"/tmp/homelab-age-keys.txt " +
-				"/root/.config/sops/age/keys.txt && " +
-				"rm -f /tmp/homelab-age-keys.txt"
-
-		if err := ageInstall.Run(
-			ageInstallCmd,
+		if out, err := sudoRun(
+			client,
+			password,
+			"mkdir -p /root/.config/sops/age && "+
+				"install -m 600 /tmp/homelab-age-keys.txt "+
+				"/root/.config/sops/age/keys.txt && "+
+				"rm -f /tmp/homelab-age-keys.txt",
 		); err != nil {
-			ageInstall.Close()
-
 			fmt.Printf(
-				"[FAIL] Could not install AGE key: %v\n",
+				"[FAIL] Could not install AGE key: %v\n%s\n",
 				err,
+				out,
 			)
 			return
 		}
-
-		ageInstall.Close()
 
 		fmt.Println("[ OK ] AGE private key installed.")
 		fmt.Println()
@@ -738,7 +709,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		}
 
 		modes := ssh.TerminalModes{
-			ssh.ECHO:          1,
+			ssh.ECHO:          0, // off so the sudo password is not echoed; re-enabled after sudo -v
 			ssh.TTY_OP_ISPEED: 14400,
 			ssh.TTY_OP_OSPEED: 14400,
 		}
@@ -766,12 +737,24 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		ranRemote = true
 
-		runSession.Stdin = os.Stdin
+		runStdin, err := runSession.StdinPipe()
+
+		if err != nil {
+			runSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not open remote input: %v\n",
+				err,
+			)
+			return
+		}
+
 		runSession.Stdout = os.Stdout
 		runSession.Stderr = os.Stderr
 
 		remoteCommand := fmt.Sprintf(
-			"sudo -n env HOME=/root "+
+			"sudo -S -p '' -v && stty echo && "+
+				"sudo -n env HOME=/root "+
 				"BOOTSTRAP_PACKAGE_DIR=%s/generated/bootstrap "+
 				"bash %s/install.sh --run %s",
 			remoteRoot,
@@ -784,7 +767,19 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			restore = func() { _ = term.Restore(fd, oldState) }
 		}
 
-		runErr := runSession.Run(remoteCommand)
+		runErr := runSession.Start(remoteCommand)
+
+		if runErr == nil {
+			// First line goes to "sudo -S"; everything after is the user's typing.
+			_, _ = io.WriteString(runStdin, password+"\n")
+
+			go func() {
+				_, _ = io.Copy(runStdin, os.Stdin)
+			}()
+
+			runErr = runSession.Wait()
+		}
+
 		restore()
 
 		if err := runErr; err != nil {
@@ -1064,6 +1059,48 @@ func copyFileOverSSH(
 	return session.Run(command)
 }
 
+
+// sudoRun runs a shell script as root on the remote host, feeding the sudo
+// password on stdin. It does not rely on a cached sudo timestamp (which does
+// not carry over between separate SSH sessions).
+func sudoRun(
+	client *ssh.Client,
+	password string,
+	script string,
+) (string, error) {
+
+	session, err := client.NewSession()
+
+	if err != nil {
+		return "", err
+	}
+
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+
+	if err != nil {
+		return "", err
+	}
+
+	var out bytes.Buffer
+
+	session.Stdout = &out
+	session.Stderr = &out
+
+	if err := session.Start(
+		"sudo -S -p '' sh -c " + shellQuote(script),
+	); err != nil {
+		return strings.TrimSpace(out.String()), err
+	}
+
+	_, _ = io.WriteString(stdin, password+"\n")
+	_ = stdin.Close()
+
+	err = session.Wait()
+
+	return strings.TrimSpace(out.String()), err
+}
 
 func shellQuote(value string) string {
 
