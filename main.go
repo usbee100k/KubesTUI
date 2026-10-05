@@ -524,7 +524,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		if err := transferSession.Start(
 			fmt.Sprintf(
 				"tar -xzf - -C %s",
-				remoteRoot,
+				shellQuote(remoteRoot),
 			),
 		); err != nil {
 			transferSession.Close()
@@ -546,20 +546,30 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
-		if err := tarCmd.Wait(); err != nil {
-			transferSession.Close()
+		// Wait for the remote side to finish reading BEFORE calling tarCmd.Wait():
+		// Wait closes the stdout pipe, and closing it while the SSH session is
+		// still reading causes "read |0: file already closed".
+		transferErr := transferSession.Wait()
 
+		if transferErr != nil {
+			// Remote stopped reading; make sure local tar cannot block on a full pipe.
+			_ = tarCmd.Process.Kill()
+		}
+
+		tarErr := tarCmd.Wait()
+
+		if transferErr != nil {
 			fmt.Printf(
-				"[FAIL] Could not create archive: %v\n",
-				err,
+				"[FAIL] Could not transfer homelabCD: %v\n",
+				transferErr,
 			)
 			return
 		}
 
-		if err := transferSession.Wait(); err != nil {
+		if tarErr != nil {
 			fmt.Printf(
-				"[FAIL] Could not transfer homelabCD: %v\n",
-				err,
+				"[FAIL] Could not create archive: %v\n",
+				tarErr,
 			)
 			return
 		}
