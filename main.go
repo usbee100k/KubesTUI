@@ -235,7 +235,11 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
-		var hostKeyLine string
+		// ssh-keyscan returns one key per type (ed25519, ecdsa, rsa). The Go SSH
+		// client may negotiate any of them, so trust all keys the user is shown
+		// instead of pinning only the first one (that caused "host key mismatch").
+		trustedKeys := map[string]bool{}
+		var fingerprints []string
 
 		for _, line := range strings.Split(
 			strings.TrimSpace(string(keyscanOutput)),
@@ -250,30 +254,57 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 			fields := strings.Fields(line)
 
-			if len(fields) >= 3 {
-				hostKeyLine = fields[1] + " " + fields[2]
-				break
+			if len(fields) < 3 {
+				continue
 			}
+
+			key, _, _, _, perr := ssh.ParseAuthorizedKey(
+				[]byte(fields[1] + " " + fields[2]),
+			)
+
+			if perr != nil {
+				continue
+			}
+
+			id := string(key.Marshal())
+
+			if trustedKeys[id] {
+				continue
+			}
+
+			trustedKeys[id] = true
+
+			fingerprints = append(
+				fingerprints,
+				fmt.Sprintf(
+					"%-22s %s",
+					key.Type(),
+					ssh.FingerprintSHA256(key),
+				),
+			)
 		}
 
-		if hostKeyLine == "" {
+		if len(trustedKeys) == 0 {
 			fmt.Println("[FAIL] Could not parse SSH host key.")
 			return
 		}
 
-		hostKey, _, _, _, err := ssh.ParseAuthorizedKey(
-			[]byte(hostKeyLine),
-		)
+		hostKeyCallback := func(
+			hostname string,
+			remote net.Addr,
+			key ssh.PublicKey,
+		) error {
 
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not parse SSH host key: %v\n",
-				err,
+			if trustedKeys[string(key.Marshal())] {
+				return nil
+			}
+
+			return fmt.Errorf(
+				"host key mismatch: server presented %s %s",
+				key.Type(),
+				ssh.FingerprintSHA256(key),
 			)
-			return
 		}
-
-		fingerprint := ssh.FingerprintSHA256(hostKey)
 
 		fmt.Println()
 		fmt.Println("==================================================")
@@ -281,7 +312,9 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Println("==================================================")
 		fmt.Println()
 		fmt.Printf("Host: %s\n", remoteHost)
-		fmt.Printf("SHA256: %s\n", fingerprint)
+		for _, fp := range fingerprints {
+			fmt.Printf("  %s\n", fp)
+		}
 		fmt.Println()
 
 		trust := readRemoteValue(
@@ -333,7 +366,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			Auth: []ssh.AuthMethod{
 				ssh.Password(password),
 			},
-			HostKeyCallback: ssh.FixedHostKey(hostKey),
+			HostKeyCallback: hostKeyCallback,
 			Timeout: 10 * time.Second,
 		}
 
