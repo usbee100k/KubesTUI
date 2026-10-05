@@ -129,7 +129,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		return
 	}
 
-	var remoteScript string
+	remoteScript := ""
 
 	switch op.Op {
 	case "remote-worker":
@@ -153,9 +153,10 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Println("==================================================")
 		fmt.Println()
 
+
 		remoteHost := readRemoteValue(
 			reader,
-			"Remote host/IP: ",
+			"IP address / hostname: ",
 		)
 
 		if remoteHost == "" {
@@ -163,60 +164,113 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
-		remoteUser := os.Getenv("USER")
+		remoteUser := os.Getenv("HOMELAB_REMOTE_USER")
+
+		if remoteUser == "" {
+			remoteUser = os.Getenv("USER")
+		}
 
 		if remoteUser == "" {
 			remoteUser = "root"
 		}
 
-		fmt.Printf("SSH user: %s\n", remoteUser)
+		remoteAddr := fmt.Sprintf(
+			"%s:22",
+			remoteHost,
+		)
+
+		fmt.Println()
+		fmt.Printf("SSH user : %s\n", remoteUser)
+		fmt.Printf("Target   : %s\n", remoteAddr)
+		fmt.Printf("Operation: %s\n", remoteScript)
 		fmt.Println()
 
-		remotePort := 22
 
-		fmt.Println("[INFO] Getting SSH host fingerprint...")
+		fmt.Println("[INFO] Reading SSH host fingerprint...")
 
-		hostKey, fingerprint, err := getSSHHostFingerprint(
+		scan := exec.Command(
+			"ssh-keyscan",
+			"-T", "10",
+			"-t",
+			"ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
 			remoteHost,
-			remotePort,
-			remoteUser,
+		)
+
+		keyscanOutput, err := scan.Output()
+
+		if err != nil || len(keyscanOutput) == 0 {
+			fmt.Printf(
+				"[FAIL] Could not retrieve SSH fingerprint from %s\n",
+				remoteHost,
+			)
+			return
+		}
+
+		var hostKeyLine string
+
+		for _, line := range strings.Split(
+			strings.TrimSpace(string(keyscanOutput)),
+			"\n",
+		) {
+
+			line = strings.TrimSpace(line)
+
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+
+			fields := strings.Fields(line)
+
+			if len(fields) >= 3 {
+				hostKeyLine = fields[1] + " " + fields[2]
+				break
+			}
+		}
+
+		if hostKeyLine == "" {
+			fmt.Println("[FAIL] Could not parse SSH host key.")
+			return
+		}
+
+		hostKey, _, _, _, err := ssh.ParseAuthorizedKey(
+			[]byte(hostKeyLine),
 		)
 
 		if err != nil {
 			fmt.Printf(
-				"[FAIL] Could not get SSH fingerprint: %v\n",
+				"[FAIL] Could not parse SSH host key: %v\n",
 				err,
 			)
 			return
 		}
 
+		fingerprint := ssh.FingerprintSHA256(hostKey)
+
 		fmt.Println()
 		fmt.Println("==================================================")
-		fmt.Println("                 SSH HOST FINGERPRINT")
+		fmt.Println("                 SSH FINGERPRINT")
 		fmt.Println("==================================================")
 		fmt.Println()
 		fmt.Printf("Host: %s\n", remoteHost)
-		fmt.Printf("SHA256 fingerprint:\n")
-		fmt.Printf("  %s\n", fingerprint)
+		fmt.Printf("SHA256: %s\n", fingerprint)
 		fmt.Println()
 
-		confirm := strings.ToLower(
-			strings.TrimSpace(
-				readRemoteValue(
-					reader,
-					"Accept this fingerprint? [y/N]: ",
-				),
-			),
+		trust := readRemoteValue(
+			reader,
+			"Trust this host fingerprint? [y/N]: ",
 		)
 
-		if confirm != "y" && confirm != "yes" {
-			fmt.Println("[INFO] Remote connection cancelled.")
+		if strings.ToLower(trust) != "y" &&
+			strings.ToLower(trust) != "yes" {
+
+			fmt.Println()
+			fmt.Println("SSH connection cancelled.")
 			return
 		}
 
 		fmt.Println()
 		fmt.Printf(
-			"Password for %s@%s: ",
+			"SSH password for %s@%s: ",
 			remoteUser,
 			remoteHost,
 		)
@@ -242,14 +296,22 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
+	
 		fmt.Println("[INFO] Connecting to remote node...")
 
-		client, err := connectSSHWithPassword(
-			remoteHost,
-			remotePort,
-			remoteUser,
-			password,
-			hostKey,
+		clientConfig := &ssh.ClientConfig{
+			User: remoteUser,
+			Auth: []ssh.AuthMethod{
+				ssh.Password(password),
+			},
+			HostKeyCallback: ssh.FixedHostKey(hostKey),
+			Timeout: 10 * time.Second,
+		}
+
+		client, err := ssh.Dial(
+			"tcp",
+			remoteAddr,
+			clientConfig,
 		)
 
 		if err != nil {
@@ -262,48 +324,101 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		defer client.Close()
 
-		fmt.Println("[ OK ] SSH connection successful.")
+		fmt.Println("[ OK ] SSH connection established.")
 		fmt.Println()
 
-		remoteHome, err := sshOutput(
-			client,
-			"printf '%s' \"$HOME\"",
-		)
+	
+		remoteRoot := "/opt/homelabCD"
+
+
+		fmt.Println("[INFO] Validating sudo access...")
+
+		sudoSession, err := client.NewSession()
 
 		if err != nil {
 			fmt.Printf(
-				"[FAIL] Could not determine remote home: %v\n",
+				"[FAIL] Could not create sudo session: %v\n",
 				err,
 			)
 			return
 		}
 
-		remoteHome = strings.TrimSpace(remoteHome)
+		sudoInput, err := sudoSession.StdinPipe()
 
-		if remoteHome == "" {
-			fmt.Println("[FAIL] Remote HOME is empty.")
+		if err != nil {
+			sudoSession.Close()
+			fmt.Printf(
+				"[FAIL] Could not open sudo input: %v\n",
+				err,
+			)
 			return
 		}
 
-		remoteRoot := filepath.Join(
-			remoteHome,
-			"homelabCD",
-		)
+		sudoSession.Stdout = os.Stdout
+		sudoSession.Stderr = os.Stderr
+
+		if err := sudoSession.Start(
+			"sudo -S -p '' -v",
+		); err != nil {
+			sudoSession.Close()
+			fmt.Printf(
+				"[FAIL] Could not validate sudo access: %v\n",
+				err,
+			)
+			return
+		}
+
+		if _, err := io.WriteString(
+			sudoInput,
+			password+"\n",
+		); err != nil {
+			sudoSession.Close()
+			fmt.Printf(
+				"[FAIL] Could not send sudo password: %v\n",
+				err,
+			)
+			return
+		}
+
+		_ = sudoInput.Close()
+
+		if err := sudoSession.Wait(); err != nil {
+			fmt.Printf(
+				"[FAIL] Sudo authentication failed: %v\n",
+				err,
+			)
+			return
+		}
+
+		fmt.Println("[ OK ] Sudo access confirmed.")
+		fmt.Println()
+
 
 		fmt.Println("[INFO] Preparing remote directory...")
 
+		prepareSession, err := client.NewSession()
+
+		if err != nil {
+			fmt.Printf(
+				"[FAIL] Could not create remote session: %v\n",
+				err,
+			)
+			return
+		}
+
 		prepareCmd := fmt.Sprintf(
-			"mkdir -p %s/generated/bootstrap/secrets %s/.config/sops/age",
-			shellQuote(remoteRoot),
-			shellQuote(remoteHome),
+			"sudo -n mkdir -p %s && "+
+				"sudo -n chown %s:%s %s",
+			remoteRoot,
+			remoteUser,
+			remoteUser,
+			remoteRoot,
 		)
 
-		if err := sshRun(
-			client,
+		if err := prepareSession.Run(
 			prepareCmd,
-			nil,
-			nil,
 		); err != nil {
+			prepareSession.Close()
 
 			fmt.Printf(
 				"[FAIL] Could not prepare remote directory: %v\n",
@@ -312,34 +427,105 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			return
 		}
 
+		prepareSession.Close()
+
 		fmt.Println("[ OK ] Remote directory ready.")
 		fmt.Println()
 
-		fmt.Println("[INFO] Copying homelabCD to remote node...")
+
+		fmt.Println("[INFO] Copying homelabCD...")
 
 		sourceRoot := filepath.Dir(install)
 
-		if err := copyRepositoryOverSSH(
-			client,
+		tarCmd := exec.Command(
+			"tar",
+			"--exclude=.git",
+			"--exclude=generated/secrets",
+			"-C",
 			sourceRoot,
-			remoteRoot,
-		); err != nil {
+			"-czf",
+			"-",
+			".",
+		)
 
+		tarOutput, err := tarCmd.StdoutPipe()
+
+		if err != nil {
 			fmt.Printf(
-				"[FAIL] Could not copy homelabCD: %v\n",
+				"[FAIL] Could not create archive: %v\n",
 				err,
 			)
 			return
 		}
 
-		fmt.Println("[ OK ] homelabCD copied.")
+		transferSession, err := client.NewSession()
+
+		if err != nil {
+			fmt.Printf(
+				"[FAIL] Could not create transfer session: %v\n",
+				err,
+			)
+			return
+		}
+
+		transferSession.Stdin = tarOutput
+		transferSession.Stdout = os.Stdout
+		transferSession.Stderr = os.Stderr
+
+		if err := transferSession.Start(
+			fmt.Sprintf(
+				"tar -xzf - -C %s",
+				remoteRoot,
+			),
+		); err != nil {
+			transferSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not start remote transfer: %v\n",
+				err,
+			)
+			return
+		}
+
+		if err := tarCmd.Start(); err != nil {
+			transferSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not start local archive: %v\n",
+				err,
+			)
+			return
+		}
+
+		if err := tarCmd.Wait(); err != nil {
+			transferSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not create archive: %v\n",
+				err,
+			)
+			return
+		}
+
+		if err := transferSession.Wait(); err != nil {
+			fmt.Printf(
+				"[FAIL] Could not transfer homelabCD: %v\n",
+				err,
+			)
+			return
+		}
+
+		fmt.Println(
+			"[ OK ] homelabCD copied to remote node.",
+		)
 		fmt.Println()
+
 
 		localHome, err := os.UserHomeDir()
 
 		if err != nil {
 			fmt.Printf(
-				"[FAIL] Could not determine local home: %v\n",
+				"[FAIL] Could not determine local home directory: %v\n",
 				err,
 			)
 			return
@@ -354,146 +540,203 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		)
 
 		if _, err := os.Stat(ageKey); err != nil {
-			fmt.Println()
-			fmt.Println("[FAIL] AGE private key not found:")
-			fmt.Println(ageKey)
-			fmt.Println()
-			fmt.Println(
-				"Run the bootstrap package step first.",
+			fmt.Printf(
+				"[FAIL] AGE key not found: %s\n",
+				ageKey,
+			)
+			return
+		}
+
+		ageData, err := os.ReadFile(ageKey)
+
+		if err != nil {
+			fmt.Printf(
+				"[FAIL] Could not read AGE key: %v\n",
+				err,
 			)
 			return
 		}
 
 		fmt.Println("[INFO] Copying AGE private key...")
 
-		remoteAgeKey := filepath.Join(
-			remoteHome,
-			".config",
-			"sops",
-			"age",
-			"keys.txt",
-		)
+		ageSession, err := client.NewSession()
 
-		if err := copyFileOverSSH(
-			client,
-			ageKey,
-			remoteAgeKey,
-			"600",
-		); err != nil {
-
+		if err != nil {
 			fmt.Printf(
-				"[FAIL] Could not copy AGE private key: %v\n",
+				"[FAIL] Could not create AGE transfer session: %v\n",
 				err,
 			)
 			return
 		}
 
-		fmt.Println("[ OK ] AGE private key copied.")
+		ageInput, err := ageSession.StdinPipe()
+
+		if err != nil {
+			ageSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not open AGE transfer: %v\n",
+				err,
+			)
+			return
+		}
+
+		ageSession.Stdout = os.Stdout
+		ageSession.Stderr = os.Stderr
+
+		if err := ageSession.Start(
+			"cat > /tmp/homelab-age-keys.txt",
+		); err != nil {
+			ageSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not start AGE transfer: %v\n",
+				err,
+			)
+			return
+		}
+
+		if _, err := ageInput.Write(ageData); err != nil {
+			ageSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not send AGE key: %v\n",
+				err,
+			)
+			return
+		}
+
+		_ = ageInput.Close()
+
+		if err := ageSession.Wait(); err != nil {
+			fmt.Printf(
+				"[FAIL] AGE key transfer failed: %v\n",
+				err,
+			)
+			return
+		}
+
+		
+
+		ageInstall, err := client.NewSession()
+
+		if err != nil {
+			fmt.Printf(
+				"[FAIL] Could not create AGE install session: %v\n",
+				err,
+			)
+			return
+		}
+
+		ageInstallCmd :=
+			"sudo -n mkdir -p /root/.config/sops/age && " +
+				"sudo -n install -m 600 " +
+				"/tmp/homelab-age-keys.txt " +
+				"/root/.config/sops/age/keys.txt && " +
+				"rm -f /tmp/homelab-age-keys.txt"
+
+		if err := ageInstall.Run(
+			ageInstallCmd,
+		); err != nil {
+			ageInstall.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not install AGE key: %v\n",
+				err,
+			)
+			return
+		}
+
+		ageInstall.Close()
+
+		fmt.Println("[ OK ] AGE private key installed.")
 		fmt.Println()
 
 		fmt.Printf(
-			"[INFO] Starting remote %s operation...\n",
+			"[INFO] Executing %s on %s...\n",
+			remoteScript,
+			remoteHost,
+		)
+
+		runSession, err := client.NewSession()
+
+		if err != nil {
+			fmt.Printf(
+				"[FAIL] Could not create execution session: %v\n",
+				err,
+			)
+			return
+		}
+
+		termWidth := 120
+		termHeight := 40
+
+		modes := ssh.TerminalModes{
+			ssh.ECHO:          1,
+			ssh.TTY_OP_ISPEED: 14400,
+			ssh.TTY_OP_OSPEED: 14400,
+		}
+
+		termName := os.Getenv("TERM")
+
+		if termName == "" {
+			termName = "xterm"
+		}
+
+		if err := runSession.RequestPty(
+			termName,
+			termHeight,
+			termWidth,
+			modes,
+		); err != nil {
+			runSession.Close()
+
+			fmt.Printf(
+				"[FAIL] Could not allocate remote terminal: %v\n",
+				err,
+			)
+			return
+		}
+
+		runSession.Stdin = os.Stdin
+		runSession.Stdout = os.Stdout
+		runSession.Stderr = os.Stderr
+
+		remoteCommand := fmt.Sprintf(
+			"sudo -n env HOME=/root "+
+				"BOOTSTRAP_PACKAGE_DIR=%s/generated/bootstrap "+
+				"bash %s/install.sh --run %s",
+			remoteRoot,
+			remoteRoot,
 			remoteScript,
 		)
 
-		remoteInstaller := filepath.Join(
-			remoteRoot,
-			"install.sh",
-		)
-
-		bootstrapPackageDir := filepath.Join(
-			remoteRoot,
-			"generated",
-			"bootstrap",
-		)
-
-		remoteCommand := fmt.Sprintf(
-			"sudo -S -p '' env HOME=%s BOOTSTRAP_REPO=%s BOOTSTRAP_PACKAGE_DIR=%s bash %s --run %s",
-			shellQuote(remoteHome),
-			shellQuote(
-				os.Getenv("BOOTSTRAP_REPO"),
-			),
-			shellQuote(bootstrapPackageDir),
-			shellQuote(remoteInstaller),
-			shellQuote(remoteScript),
-		)
-
-		session, err := client.NewSession()
-
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not create remote session: %v\n",
-				err,
-			)
-			return
-		}
-
-		defer session.Close()
-
-		session.Stdout = os.Stdout
-		session.Stderr = os.Stderr
-
-		sessionStdin, err := session.StdinPipe()
-
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not open remote stdin: %v\n",
-				err,
-			)
-			return
-		}
-
-		if err := session.Start(remoteCommand); err != nil {
-			fmt.Printf(
-				"[FAIL] Could not start remote installer: %v\n",
-				err,
-			)
-			return
-		}
-
-		if _, err := fmt.Fprintf(
-			sessionStdin,
-			"%s\n",
-			password,
+		if err := runSession.Run(
+			remoteCommand,
 		); err != nil {
 
-			fmt.Printf(
-				"[FAIL] Could not send sudo password: %v\n",
-				err,
-			)
-
-			_ = session.Close()
-			return
-		}
-
-
-		go func() {
-			_, _ = io.Copy(
-				sessionStdin,
-				os.Stdin,
-			)
-		}()
-
-		if err := session.Wait(); err != nil {
 			fmt.Printf(
 				"\n[FAIL] Remote %s operation failed: %v\n",
 				remoteScript,
 				err,
 			)
+
+			runSession.Close()
 			return
 		}
 
+		runSession.Close()
+
+		fmt.Println()
 		fmt.Printf(
-			"\n[ OK ] Remote %s operation completed successfully.\n",
+			"[ OK ] Remote %s operation completed.\n",
 			remoteScript,
 		)
 	})
 
-	fmt.Print(
-		"\nPress Enter to return to KubesTUI...",
-	)
-
-	_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
+	// IMPORTANT:
+	// Do NOT read os.Stdin here.
+	// app.Suspend() returns to the TUI automatically.
 }
 
 func getSSHHostFingerprint(
@@ -756,23 +999,6 @@ func shellQuote(value string) string {
 			"'\\''",
 		) +
 		"'"
-}
-
-
-func readRemoteValue(
-	reader *bufio.Reader,
-	prompt string,
-) string {
-
-	fmt.Print(prompt)
-
-	value, err := reader.ReadString('\n')
-
-	if err != nil {
-		return ""
-	}
-
-	return strings.TrimSpace(value)
 }
 
 func readRemoteValue(reader *bufio.Reader, prompt string) string {
