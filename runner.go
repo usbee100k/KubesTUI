@@ -56,16 +56,40 @@ type termBuffer struct {
 	lines     []string // committed, already translated
 	plain     []string // the same lines as plain text, for copy/save
 	sshKey    string   // last public SSH key seen in the output
+	cleared   bool     // the screen was cleared since the last render
 	current   []rune   // raw text of the line being written
 	crPending bool
 	dirty     bool
 }
 
+// clearScreen is what `clear` (and the installer between steps) sends.
+const clearScreen = "\x1b[2J"
+
 func (b *termBuffer) write(p []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	for _, r := range string(p) {
+	// A screen clear starts a fresh view. The full output is still kept
+	// in plain for copy all (Y) and save log (S).
+	s := string(p)
+	for {
+		i := strings.Index(s, clearScreen)
+		if i < 0 {
+			break
+		}
+		b.writeLocked(s[:i])
+		b.current = b.current[:0]
+		b.crPending = false
+		b.lines = b.lines[:0]
+		b.cleared = true
+		s = s[i+len(clearScreen):]
+	}
+	b.writeLocked(s)
+	b.dirty = true
+}
+
+func (b *termBuffer) writeLocked(s string) {
+	for _, r := range s {
 		if b.crPending {
 			b.crPending = false
 			if r != '\n' {
@@ -88,7 +112,6 @@ func (b *termBuffer) write(p []byte) {
 			b.current = append(b.current, r)
 		}
 	}
-	b.dirty = true
 }
 
 func (b *termBuffer) commitLocked() {
@@ -134,6 +157,15 @@ func (b *termBuffer) text() string {
 		out += "\n" + plainLine(string(b.current))
 	}
 	return out + "\n"
+}
+
+// takeCleared reports (once) that the screen was cleared.
+func (b *termBuffer) takeCleared() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	c := b.cleared
+	b.cleared = false
+	return c
 }
 
 // render returns the full text if it changed since the last call.
@@ -225,6 +257,16 @@ func newRunner(app *tview.Application, pages *tview.Pages, footer *tview.TextVie
 	r.body.SetBorder(true).
 		SetTitle(" HOMELAB KUBERNETES PLATFORM ").
 		SetTitleAlign(tview.AlignLeft)
+
+	// Click anywhere while it's running to type an answer: focus goes to
+	// the input bar instead of the output. The mouse wheel still scrolls.
+	r.body.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		if r.running && (action == tview.MouseLeftDown || action == tview.MouseLeftClick) {
+			r.app.SetFocus(r.input)
+			return action, nil
+		}
+		return action, event
+	})
 
 	r.screen = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(r.body, 0, 1, true).
@@ -419,7 +461,12 @@ func (r *runner) tick() {
 	}
 
 	row, _ := r.output.GetScrollOffset()
-	if r.follow && row < r.lastRow {
+	if r.buf.takeCleared() {
+		// The screen was cleared (new installer step): start at the top
+		// and keep following.
+		r.follow, r.lastRow, row = true, 0, 0
+		r.output.ScrollToBeginning()
+	} else if r.follow && row < r.lastRow {
 		// The user scrolled up (mouse wheel): stop following.
 		r.follow = false
 	}
