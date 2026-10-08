@@ -69,6 +69,8 @@ type termView struct {
 	hasSel    bool
 	selA      cellPos
 	selB      cellPos
+	lastX     int          // mouse column during a drag
+	drag      dragScroller // keeps scrolling while dragged past an edge
 
 	onNotice       func(msg string) // short status messages ("Copied ...")
 	onScrollChange func()
@@ -91,12 +93,30 @@ func (t *termView) pushHistory(line []vt10x.Glyph) {
 }
 
 func newTermView(app *tview.Application) *termView {
-	return &termView{
+	t := &termView{
 		Box:  tview.NewBox(),
 		app:  app,
 		cols: 100,
 		rows: 30,
 	}
+	t.drag.app = app
+	return t
+}
+
+// dragStep scrolls during a drag past an edge and extends the selection.
+func (t *termView) dragStep(dir int) {
+	if !t.selecting {
+		t.drag.update(0, nil)
+		return
+	}
+	t.ScrollBy(-dir) // scroll counts lines back from the live screen
+	_, iy, _, h := t.GetInnerRect()
+	y := iy
+	if dir > 0 {
+		y = iy + h - 1
+	}
+	t.selB = t.posAt(t.lastX, y)
+	t.hasSel = t.selA != t.selB
 }
 
 // termBackend is where the terminal's keystrokes go and how it is resized:
@@ -683,18 +703,21 @@ func (t *termView) MouseHandler() func(action tview.MouseAction, event *tcell.Ev
 			if inside {
 				setFocus(t)
 				p := t.posAt(x, y)
-				t.selA, t.selB = p, p
+				t.selA, t.selB, t.lastX = p, p, x
 				t.selecting, t.hasSel = true, false
 				return true, t // capture the drag
 			}
 		case tview.MouseMove:
 			if t.selecting {
 				_, iy, _, h := t.GetInnerRect()
+				dir := 0
 				if y < iy {
-					t.ScrollBy(1) // drag above the top: scroll back
+					dir = -1 // above the top: scroll back
 				} else if y >= iy+h {
-					t.ScrollBy(-1)
+					dir = 1
 				}
+				t.lastX = x
+				t.drag.update(dir, t.dragStep)
 				t.selB = t.posAt(x, y)
 				t.hasSel = t.selA != t.selB
 				return true, t
@@ -702,6 +725,7 @@ func (t *termView) MouseHandler() func(action tview.MouseAction, event *tcell.Ev
 		case tview.MouseLeftUp:
 			if t.selecting {
 				t.selecting = false
+				t.drag.update(0, nil)
 				if t.hasSel {
 					text := t.SelectionText()
 					n := strings.Count(text, "\n") + 1

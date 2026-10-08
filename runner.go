@@ -30,11 +30,10 @@ var tuiRunner *runner
 const maxOutputLines = 5000
 
 // ---------------------------------------------------------------------------
-// Output buffer: turns a raw terminal byte stream into tview text
+// Output buffer: turns a raw terminal byte stream into styled lines
 // ---------------------------------------------------------------------------
 
-// OSC sequences (window titles etc.) terminated by BEL, which tview's ANSI
-// parser would otherwise treat as unterminated and swallow following text.
+// OSC sequences (window titles etc.), terminated by BEL or ESC \.
 var oscPattern = regexp.MustCompile("\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)")
 
 // Any escape sequence, for the plain-text copy of the output.
@@ -44,17 +43,13 @@ func plainLine(s string) string {
 	return ansiPattern.ReplaceAllString(oscPattern.ReplaceAllString(s, ""), "")
 }
 
-func translateLine(s string) string {
-	s = oscPattern.ReplaceAllString(s, "")
-	// Escape first so log prefixes like "[INFO]" are not read as style tags,
-	// then convert ANSI colors to tview tags.
-	return tview.TranslateANSI(tview.Escape(s))
-}
-
 type termBuffer struct {
 	mu        sync.Mutex
-	lines     []string // committed, already translated
-	plain     []string // the same lines as plain text, for copy/save
+	lines     []logLine // committed lines shown on screen
+	base      int       // absolute number of lines[0] (cleared/trimmed count)
+	style     tcell.Style
+	styleSet  bool
+	plain     []string // all output as plain text, for copy/save
 	sshKey    string   // last public SSH key seen in the output
 	cleared   bool     // the screen was cleared since the last render
 	current   []rune   // raw text of the line being written
@@ -80,7 +75,8 @@ func (b *termBuffer) write(p []byte) {
 		b.writeLocked(s[:i])
 		b.current = b.current[:0]
 		b.crPending = false
-		b.lines = b.lines[:0]
+		b.base += len(b.lines)
+		b.lines = nil
 		b.cleared = true
 		s = s[i+len(clearScreen):]
 	}
@@ -116,28 +112,39 @@ func (b *termBuffer) writeLocked(s string) {
 
 func (b *termBuffer) commitLocked() {
 	raw := string(b.current)
-	b.lines = append(b.lines, translateLine(raw))
+	var line logLine
+	line, b.style = parseANSI(raw, b.curStyle())
+	b.lines = append(b.lines, line)
 	b.plain = append(b.plain, plainLine(raw))
 	if k := sshPublicKey.FindString(b.plain[len(b.plain)-1]); k != "" {
 		b.sshKey = strings.TrimSpace(k)
 	}
 	b.current = b.current[:0]
-	if len(b.lines) > maxOutputLines {
-		b.lines = b.lines[len(b.lines)-maxOutputLines:]
-		b.plain = b.plain[len(b.plain)-maxOutputLines:]
+	if n := len(b.lines) - maxOutputLines; n > 0 {
+		b.lines = b.lines[n:]
+		b.base += n
+	}
+	if n := len(b.plain) - maxOutputLines; n > 0 {
+		b.plain = b.plain[n:]
 	}
 }
 
-// appendMarkup adds a line that is already in tview markup; plain is its
-// text-only form.
-func (b *termBuffer) appendMarkup(line, plain string) {
+func (b *termBuffer) curStyle() tcell.Style {
+	if !b.styleSet {
+		b.style, b.styleSet = baseLogStyle(), true
+	}
+	return b.style
+}
+
+// appendLine adds a line of KubesTUI's own (e.g. "-- Completed --").
+func (b *termBuffer) appendLine(text string, st tcell.Style) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.current) > 0 {
 		b.commitLocked()
 	}
-	b.lines = append(b.lines, line)
-	b.plain = append(b.plain, plain)
+	b.lines = append(b.lines, styledLine(text, st))
+	b.plain = append(b.plain, text)
 	b.dirty = true
 }
 
@@ -168,19 +175,21 @@ func (b *termBuffer) takeCleared() bool {
 	return c
 }
 
-// render returns the full text if it changed since the last call.
-func (b *termBuffer) render() (string, bool) {
+// render returns the lines on screen (and the absolute number of the
+// first) if they changed since the last call.
+func (b *termBuffer) render() ([]logLine, int, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.dirty {
-		return "", false
+		return nil, 0, false
 	}
 	b.dirty = false
-	text := strings.Join(b.lines, "\n")
+	lines := append([]logLine(nil), b.lines...)
 	if len(b.current) > 0 {
-		text += "\n" + translateLine(string(b.current))
+		line, _ := parseANSI(string(b.current), b.curStyle())
+		lines = append(lines, line)
 	}
-	return text, true
+	return lines, b.base, true
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +205,7 @@ type runner struct {
 	screen *tview.Flex
 	body   *tview.Flex
 	header *tview.TextView
-	output *tview.TextView
+	output *logView
 	input  *tview.InputField
 
 	mu        sync.Mutex
@@ -210,8 +219,6 @@ type runner struct {
 	status    string // markup for the status badge
 	notice    string // short message in the header ("Saved log to ...")
 	shownKey  string // SSH key the user was told about
-	follow    bool
-	lastRow   int
 	lastCols  int
 	lastRows  int
 	masked    bool
@@ -222,11 +229,19 @@ func newRunner(app *tview.Application, pages *tview.Pages, footer *tview.TextVie
 
 	r.header = tview.NewTextView().SetDynamicColors(true)
 
-	r.output = tview.NewTextView().
-		SetDynamicColors(true).
-		SetScrollable(true).
-		SetWrap(true)
+	// Drag to select and copy; clicking while it runs goes to the input bar.
+	r.output = newLogView(app)
 	r.output.SetBorderPadding(0, 0, 2, 1)
+	r.output.clickFocus = func() tview.Primitive {
+		if r.running {
+			return r.input
+		}
+		return r.output
+	}
+	r.output.onCopy = func(text string) {
+		n := strings.Count(text, "\n") + 1
+		r.copyText(text, fmt.Sprintf("%d line(s)", n))
+	}
 
 	r.input = tview.NewInputField().
 		SetLabel("  INPUT > ").
@@ -259,9 +274,10 @@ func newRunner(app *tview.Application, pages *tview.Pages, footer *tview.TextVie
 		SetTitleAlign(tview.AlignLeft)
 
 	// Click anywhere while it's running to type an answer: focus goes to
-	// the input bar instead of the output. The mouse wheel still scrolls.
+	// the input bar. (Clicks in the output select text and focus it too.)
 	r.body.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
-		if r.running && (action == tview.MouseLeftDown || action == tview.MouseLeftClick) {
+		x, y := event.Position()
+		if r.running && !r.output.InRect(x, y) && (action == tview.MouseLeftDown || action == tview.MouseLeftClick) {
 			r.app.SetFocus(r.input)
 			return action, nil
 		}
@@ -341,12 +357,10 @@ func (r *runner) start(op operation) {
 	r.notice = ""
 	r.shownKey = ""
 	r.buf = &termBuffer{}
-	r.follow = true
-	r.lastRow = 0
 	r.lastCols, r.lastRows = 0, 0
 	r.masked = false
 	r.input.SetText("").SetLabel("  INPUT > ").SetMaskCharacter(0)
-	r.output.SetText("")
+	r.output.Reset()
 	r.body.ResizeItem(r.input, 1, 0)
 
 	r.pages.AddAndSwitchToPage("run", r.screen, true)
@@ -354,14 +368,14 @@ func (r *runner) start(op operation) {
 	install := installerPath()
 	if install == "" {
 		r.finishNow("[red::b]NOT STARTED[-::-]",
-			"[red]HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.[-]")
+			"HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.")
 		return
 	}
 
 	master, slave, err := openPTY()
 	if err != nil {
 		r.finishNow("[red::b]NOT STARTED[-::-]",
-			"[red]Could not open a terminal for the operation: "+tview.Escape(err.Error())+"[-]")
+			"Could not open a terminal for the operation: "+err.Error())
 		return
 	}
 
@@ -378,7 +392,7 @@ func (r *runner) start(op operation) {
 		slave.Close()
 		master.Close()
 		r.finishNow("[red::b]NOT STARTED[-::-]",
-			"[red]"+tview.Escape(err.Error())+"[-]")
+			err.Error())
 		return
 	}
 	slave.Close()
@@ -460,24 +474,14 @@ func (r *runner) tick() {
 		return
 	}
 
-	row, _ := r.output.GetScrollOffset()
 	if r.buf.takeCleared() {
 		// The screen was cleared (new installer step): start at the top
 		// and keep following.
-		r.follow, r.lastRow, row = true, 0, 0
-		r.output.ScrollToBeginning()
-	} else if r.follow && row < r.lastRow {
-		// The user scrolled up (mouse wheel): stop following.
-		r.follow = false
+		r.output.ScrollToEnd()
 	}
-
-	if text, changed := r.buf.render(); changed {
-		r.output.SetText(text)
-		if r.follow {
-			r.output.ScrollToEnd()
-		}
+	if lines, base, changed := r.buf.render(); changed {
+		r.output.SetLines(lines, base)
 	}
-	r.lastRow, _ = r.output.GetScrollOffset()
 
 	// A public SSH key was printed (e.g. the GitHub deploy key): offer it.
 	if k := r.buf.lastSSHKey(); k != "" && k != r.shownKey {
@@ -520,26 +524,27 @@ func (r *runner) finish(buf *termBuffer, code int) {
 	r.mu.Unlock()
 
 	var line string
+	st := baseLogStyle().Bold(true)
 	switch {
 	case code == 0:
 		r.status = "[black:green:b] COMPLETED [-:-:-]"
-		line = fmt.Sprintf("[green::b]-- Completed in %s --[-::-]", formatElapsed(r.elapsed))
+		line = fmt.Sprintf("-- Completed in %s --", formatElapsed(r.elapsed))
+		st = st.Foreground(tcell.ColorGreen)
 	case code == 130:
 		r.status = "[black:yellow:b] INTERRUPTED [-:-:-]"
-		line = "[yellow::b]-- Interrupted --[-::-]"
+		line = "-- Interrupted --"
+		st = st.Foreground(tcell.ColorYellow)
 	default:
 		r.status = fmt.Sprintf("[white:red:b] FAILED (exit %d) [-:-:-]", code)
-		line = fmt.Sprintf("[red::b]-- Failed with exit code %d after %s --[-::-]", code, formatElapsed(r.elapsed))
+		line = fmt.Sprintf("-- Failed with exit code %d after %s --", code, formatElapsed(r.elapsed))
+		st = st.Foreground(tcell.ColorRed)
 	}
 
-	buf.appendMarkup("", "")
-	buf.appendMarkup(line, stripTags(line))
+	buf.appendLine("", baseLogStyle())
+	buf.appendLine(line, st)
 
-	if text, changed := buf.render(); changed {
-		r.output.SetText(text)
-	}
-	if r.follow {
-		r.output.ScrollToEnd()
+	if lines, base, changed := buf.render(); changed {
+		r.output.SetLines(lines, base)
 	}
 
 	r.header.SetText(r.headerText())
@@ -552,9 +557,9 @@ func (r *runner) finishNow(status, message string) {
 	r.running = false
 	r.status = status
 	r.elapsed = 0
-	r.buf.appendMarkup(message, stripTags(message))
-	if text, changed := r.buf.render(); changed {
-		r.output.SetText(text)
+	r.buf.appendLine(message, baseLogStyle().Foreground(tcell.ColorRed))
+	if lines, base, changed := r.buf.render(); changed {
+		r.output.SetLines(lines, base)
 	}
 	r.header.SetText(r.headerText())
 	r.body.ResizeItem(r.input, 0, 0)
@@ -562,16 +567,7 @@ func (r *runner) finishNow(status, message string) {
 	r.app.SetFocus(r.output)
 }
 
-func (r *runner) scrollBy(delta int) {
-	row, _ := r.output.GetScrollOffset()
-	row += delta
-	if row < 0 {
-		row = 0
-	}
-	r.follow = false
-	r.output.ScrollTo(row, 0)
-	r.lastRow = row
-}
+func (r *runner) scrollBy(delta int) { r.output.ScrollBy(delta) }
 
 // handleKey is the runner page's input capture. UI goroutine.
 func (r *runner) handleKey(ev *tcell.EventKey) *tcell.EventKey {
@@ -615,16 +611,10 @@ func (r *runner) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 		return nil
 	case tcell.KeyHome:
 		if !r.running {
-			r.follow = false
 			r.output.ScrollToBeginning()
 			return nil
 		}
 	case tcell.KeyEnd:
-		if !r.running {
-			r.output.ScrollToEnd()
-			return nil
-		}
-		r.follow = true
 		r.output.ScrollToEnd()
 		return nil
 	case tcell.KeyEscape:
@@ -663,8 +653,3 @@ func (r *runner) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 	}
 	return ev
 }
-
-// stripTags removes tview style tags from markup we generated ourselves.
-var tagPattern = regexp.MustCompile(`\[[a-zA-Z0-9_,;: \-\."#]*\]`)
-
-func stripTags(s string) string { return tagPattern.ReplaceAllString(s, "") }
