@@ -4,22 +4,22 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"os"
 	"io"
 	"net"
-	"strconv"
-	"time"
+	"os"
 	"os/exec"
 	osuser "os/user"
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/term"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,12 +35,13 @@ type operation struct {
 	Desc     string
 	Op       string // install.sh --run argument
 	Commands []string
+	ReadOnly bool // safe to run in dry-run mode: changes nothing
 }
 
 var cluster = clusterInfo{
 	Name:    "homelab",
 	Version: "v1.36.2",
-	VIP:     "192.168.50.222", 
+	VIP:     "192.168.50.222",
 	Runtime: "containerd",
 	CNI:     "cilium",
 }
@@ -97,6 +98,47 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Move Node to Dedicated Longhorn Disk",
+		Desc:  "Format a spare disk on a node, add it to Longhorn with all its space, move that node's replicas off the OS disk, then remove the old disk. No downtime; asks before anything is erased, and re-running resumes an interrupted move.",
+		Op:    "longhorn-disk",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run longhorn-disk",
+		},
+	},
+	{
+		Title: "Import Docker Compose App",
+		Desc:  "Turn a docker-compose.yml into an app in your GitOps repo (apps/applications/<name>): web UIs get https://<name>.<domain>, LAN services a MetalLB IP, volumes go on Longhorn and passwords into a cluster Secret. Then it deploys and waits until it's healthy.",
+		Op:    "compose-import",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run compose-import",
+		},
+	},
+	{
+		Title: "Remove Imported App",
+		Desc:  "Remove an app imported from Docker Compose, including its volumes and secrets.",
+		Op:    "compose-remove",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run compose-remove",
+		},
+	},
+	{
+		Title: "VPN Status",
+		Desc:  "WireGuard (wg-easy) health: server, public endpoint, router forward target, connected clients and handshakes.",
+		Op:    "vpn-status",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run vpn-status",
+		},
+		ReadOnly: true,
+	},
+	{
+		Title: "Set Up VPN",
+		Desc:  "Add (or change) the WireGuard VPN: asks for the node subnet, public endpoint, port, VPN IP and web UI password, then deploys wg-easy through GitOps.",
+		Op:    "vpn-setup",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run vpn-setup",
+		},
+	},
+	{
 		Title: "Generate Join Commands",
 		Desc:  "Print fresh join commands for control plane and worker nodes.",
 		Op:    "join-commands",
@@ -106,45 +148,43 @@ var operations = []operation{
 	},
 	{
 		Title: "Cluster Health Check",
-		Desc:  "Verify nodes, system pods, etcd and Cilium status.",
+		Desc:  "Report on nodes, control plane, etcd, Cilium, MetalLB, ingress, DNS, Argo CD apps, pods, storage and certificates.",
 		Op:    "health",
 		Commands: []string{
 			"${HOMELABCD_INSTALL} --run health",
 		},
+		ReadOnly: true,
 	},
 	{
 		Title: "Cluster Configuration",
-		Desc:  "Show the current cluster configuration.",
+		Desc:  "Show config/cluster.yaml and the live kubeadm cluster configuration.",
 		Op:    "config",
 		Commands: []string{
 			"${HOMELABCD_INSTALL} --run config",
 		},
+		ReadOnly: true,
 	},
 }
 
 const toggleTitle = "Toggle Dry-Run / Live"
 
-// notice leaves the TUI, prints a message, and waits for Enter so the message
-// is not wiped when the TUI redraws.
-func notice(app *tview.Application, msg string) {
-	app.Suspend(func() {
-		fmt.Printf("\n%s\n\nPress Enter to return to KubesTUI...", msg)
-		_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
-	})
-}
-
-func runRemoteOperation(app *tview.Application, op operation) {
+// remoteFlow provisions a node over SSH and runs its join remotely. It runs
+// in a KubesTUI subprocess on the embedded terminal (see remotejoin.go), so
+// it talks to the user through plain stdin/stdout. Values already collected
+// by the remote-join form are taken from pre instead of being prompted for.
+// Returns true on success.
+func remoteFlow(opName string, pre remotePrefill) bool {
 
 	install := installerPath()
 
 	if install == "" {
-		notice(app, "HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.")
-		return
+		fmt.Println("[FAIL] HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.")
+		return false
 	}
 
 	remoteScript := ""
 
-	switch op.Op {
+	switch opName {
 	case "remote-worker":
 		remoteScript = "worker"
 
@@ -152,23 +192,13 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		remoteScript = "controlplane"
 
 	default:
-		notice(app, "Unsupported remote operation: "+op.Op)
-		return
+		fmt.Println("[FAIL] Unsupported remote operation: " + opName)
+		return false
 	}
 
-	app.Suspend(func() {
+	{
 
 		reader := bufio.NewReader(os.Stdin)
-
-		// Pause on any failure before the remote session starts, otherwise the
-		// TUI redraws immediately and the error text disappears.
-		ranRemote := false
-		defer func() {
-			if !ranRemote {
-				fmt.Print("\nPress Enter to return to KubesTUI...")
-				_, _ = reader.ReadString('\n')
-			}
-		}()
 
 		fmt.Println()
 		fmt.Println("==================================================")
@@ -176,15 +206,17 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Println("==================================================")
 		fmt.Println()
 
-
-		remoteHost := readRemoteValue(
-			reader,
-			"IP address / hostname: ",
-		)
+		remoteHost := pre.Host
+		if remoteHost == "" {
+			remoteHost = readRemoteValue(
+				reader,
+				"IP address / hostname: ",
+			)
+		}
 
 		if remoteHost == "" {
 			fmt.Println("Remote host cannot be empty.")
-			return
+			return false
 		}
 
 		// Ask for the SSH username instead of silently picking one.
@@ -196,7 +228,10 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			userPrompt = fmt.Sprintf("SSH username [%s]: ", defaultUser)
 		}
 
-		remoteUser := readRemoteValue(reader, userPrompt)
+		remoteUser := pre.User
+		if remoteUser == "" {
+			remoteUser = readRemoteValue(reader, userPrompt)
+		}
 
 		if remoteUser == "" {
 			remoteUser = defaultUser
@@ -204,13 +239,15 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		if remoteUser == "" {
 			fmt.Println("SSH username cannot be empty.")
-			return
+			return false
 		}
 
-		remoteAddr := fmt.Sprintf(
-			"%s:22",
-			remoteHost,
-		)
+		remotePort := pre.Port
+		if remotePort <= 0 {
+			remotePort = 22
+		}
+
+		remoteAddr := net.JoinHostPort(remoteHost, strconv.Itoa(remotePort))
 
 		fmt.Println()
 		fmt.Printf("SSH user : %s\n", remoteUser)
@@ -218,12 +255,12 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Printf("Operation: %s\n", remoteScript)
 		fmt.Println()
 
-
 		fmt.Println("[INFO] Reading SSH host fingerprint...")
 
 		scan := exec.Command(
 			"ssh-keyscan",
 			"-T", "10",
+			"-p", strconv.Itoa(remotePort),
 			"-t",
 			"ed25519,ecdsa,rsa",
 			remoteHost,
@@ -236,7 +273,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not retrieve SSH fingerprint from %s\n",
 				remoteHost,
 			)
-			return
+			return false
 		}
 
 		// ssh-keyscan returns one key per type (ed25519, ecdsa, rsa). The Go SSH
@@ -290,7 +327,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		if len(trustedKeys) == 0 {
 			fmt.Println("[FAIL] Could not parse SSH host key.")
-			return
+			return false
 		}
 
 		hostKeyCallback := func(
@@ -331,38 +368,41 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 			fmt.Println()
 			fmt.Println("SSH connection cancelled.")
-			return
+			return false
 		}
 
-		fmt.Println()
-		fmt.Printf(
-			"SSH password for %s@%s: ",
-			remoteUser,
-			remoteHost,
-		)
+		password := pre.Password
 
-		passwordBytes, err := term.ReadPassword(
-			int(os.Stdin.Fd()),
-		)
-
-		fmt.Println()
-
-		if err != nil {
+		if password == "" {
+			fmt.Println()
 			fmt.Printf(
-				"[FAIL] Could not read password: %v\n",
-				err,
+				"SSH password for %s@%s: ",
+				remoteUser,
+				remoteHost,
 			)
-			return
-		}
 
-		password := string(passwordBytes)
+			passwordBytes, err := term.ReadPassword(
+				int(os.Stdin.Fd()),
+			)
+
+			fmt.Println()
+
+			if err != nil {
+				fmt.Printf(
+					"[FAIL] Could not read password: %v\n",
+					err,
+				)
+				return false
+			}
+
+			password = string(passwordBytes)
+		}
 
 		if password == "" {
 			fmt.Println("[FAIL] Password cannot be empty.")
-			return
+			return false
 		}
 
-	
 		fmt.Println("[INFO] Connecting to remote node...")
 
 		clientConfig := &ssh.ClientConfig{
@@ -371,7 +411,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				ssh.Password(password),
 			},
 			HostKeyCallback: hostKeyCallback,
-			Timeout: 10 * time.Second,
+			Timeout:         10 * time.Second,
 		}
 
 		client, err := ssh.Dial(
@@ -385,7 +425,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] SSH connection failed: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		defer client.Close()
@@ -393,9 +433,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 		fmt.Println("[ OK ] SSH connection established.")
 		fmt.Println()
 
-	
 		remoteRoot := "/opt/homelabCD"
-
 
 		fmt.Println("[INFO] Validating sudo access...")
 
@@ -406,7 +444,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not create sudo session: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		sudoInput, err := sudoSession.StdinPipe()
@@ -417,7 +455,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not open sudo input: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		sudoSession.Stdout = os.Stdout
@@ -431,7 +469,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not validate sudo access: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		if _, err := io.WriteString(
@@ -443,7 +481,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not send sudo password: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		_ = sudoInput.Close()
@@ -453,12 +491,11 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Sudo authentication failed: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		fmt.Println("[ OK ] Sudo access confirmed.")
 		fmt.Println()
-
 
 		fmt.Println("[INFO] Preparing remote directory...")
 
@@ -477,12 +514,11 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				err,
 				out,
 			)
-			return
+			return false
 		}
 
 		fmt.Println("[ OK ] Remote directory ready.")
 		fmt.Println()
-
 
 		// Workers: offer to create a fresh join token on a control plane, so no
 		// stored (possibly expired) join package or GitHub access is needed.
@@ -490,18 +526,25 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		if remoteScript == "worker" {
 
-			gen := strings.ToLower(strings.TrimSpace(readRemoteValue(
-				reader,
-				"Generate a fresh join token from a control plane now? [Y/n]: ",
-			)))
+			generate := false
 
-			if gen == "" || gen == "y" || gen == "yes" {
+			if pre.GenerateToken != nil {
+				generate = *pre.GenerateToken
+			} else {
+				gen := strings.ToLower(strings.TrimSpace(readRemoteValue(
+					reader,
+					"Generate a fresh join token from a control plane now? [Y/n]: ",
+				)))
+				generate = gen == "" || gen == "y" || gen == "yes"
+			}
+
+			if generate {
 
 				cmd, gerr := generateJoinCommand(reader, remoteUser, password)
 
 				if gerr != nil {
 					fmt.Printf("[FAIL] Could not generate join token: %v\n", gerr)
-					return
+					return false
 				}
 
 				joinCmd = cmd
@@ -551,7 +594,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				answer := readRemoteValue(reader, "Continue anyway? [y/N]: ")
 
 				if strings.ToLower(strings.TrimSpace(answer)) != "y" {
-					return
+					return false
 				}
 			}
 		}
@@ -574,7 +617,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not create archive: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		transferSession, err := client.NewSession()
@@ -584,7 +627,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not create transfer session: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		transferSession.Stdin = tarOutput
@@ -603,7 +646,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not start remote transfer: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		if err := tarCmd.Start(); err != nil {
@@ -613,7 +656,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not start local archive: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		// Wait for the remote side to finish reading BEFORE calling tarCmd.Wait():
@@ -633,7 +676,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not transfer homelabCD: %v\n",
 				transferErr,
 			)
-			return
+			return false
 		}
 
 		if tarErr != nil {
@@ -641,14 +684,13 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not create archive: %v\n",
 				tarErr,
 			)
-			return
+			return false
 		}
 
 		fmt.Println(
 			"[ OK ] homelabCD copied to remote node.",
 		)
 		fmt.Println()
-
 
 		if joinCmd != "" {
 
@@ -666,7 +708,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"700",
 			); err != nil {
 				fmt.Printf("[FAIL] Could not install join command: %v\n", err)
-				return
+				return false
 			}
 
 			fmt.Println("[ OK ] Join command installed.")
@@ -674,116 +716,114 @@ func runRemoteOperation(app *tview.Application, op operation) {
 
 		} else {
 
-		ageKey := ""
-		candidates := ageKeyCandidates()
+			ageKey := ""
+			candidates := ageKeyCandidates()
 
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				ageKey = c
-				break
-			}
-		}
-
-		if ageKey == "" {
-			fmt.Println("[FAIL] AGE key not found. Looked in:")
 			for _, c := range candidates {
-				fmt.Printf("         %s\n", c)
+				if _, err := os.Stat(c); err == nil {
+					ageKey = c
+					break
+				}
 			}
-			fmt.Println("       Set SOPS_AGE_KEY_FILE to the key's path and try again.")
-			return
-		}
 
-		fmt.Printf("[INFO] Using AGE key: %s\n", ageKey)
+			if ageKey == "" {
+				fmt.Println("[FAIL] AGE key not found. Looked in:")
+				for _, c := range candidates {
+					fmt.Printf("         %s\n", c)
+				}
+				fmt.Println("       Set SOPS_AGE_KEY_FILE to the key's path and try again.")
+				return false
+			}
 
-		ageData, err := os.ReadFile(ageKey)
+			fmt.Printf("[INFO] Using AGE key: %s\n", ageKey)
 
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not read AGE key: %v\n",
-				err,
-			)
-			return
-		}
+			ageData, err := os.ReadFile(ageKey)
 
-		fmt.Println("[INFO] Copying AGE private key...")
+			if err != nil {
+				fmt.Printf(
+					"[FAIL] Could not read AGE key: %v\n",
+					err,
+				)
+				return false
+			}
 
-		ageSession, err := client.NewSession()
+			fmt.Println("[INFO] Copying AGE private key...")
 
-		if err != nil {
-			fmt.Printf(
-				"[FAIL] Could not create AGE transfer session: %v\n",
-				err,
-			)
-			return
-		}
+			ageSession, err := client.NewSession()
 
-		ageInput, err := ageSession.StdinPipe()
+			if err != nil {
+				fmt.Printf(
+					"[FAIL] Could not create AGE transfer session: %v\n",
+					err,
+				)
+				return false
+			}
 
-		if err != nil {
-			ageSession.Close()
+			ageInput, err := ageSession.StdinPipe()
 
-			fmt.Printf(
-				"[FAIL] Could not open AGE transfer: %v\n",
-				err,
-			)
-			return
-		}
+			if err != nil {
+				ageSession.Close()
 
-		ageSession.Stdout = os.Stdout
-		ageSession.Stderr = os.Stderr
+				fmt.Printf(
+					"[FAIL] Could not open AGE transfer: %v\n",
+					err,
+				)
+				return false
+			}
 
-		if err := ageSession.Start(
-			"umask 077; cat > /tmp/homelab-age-keys.txt",
-		); err != nil {
-			ageSession.Close()
+			ageSession.Stdout = os.Stdout
+			ageSession.Stderr = os.Stderr
 
-			fmt.Printf(
-				"[FAIL] Could not start AGE transfer: %v\n",
-				err,
-			)
-			return
-		}
+			if err := ageSession.Start(
+				"umask 077; cat > /tmp/homelab-age-keys.txt",
+			); err != nil {
+				ageSession.Close()
 
-		if _, err := ageInput.Write(ageData); err != nil {
-			ageSession.Close()
+				fmt.Printf(
+					"[FAIL] Could not start AGE transfer: %v\n",
+					err,
+				)
+				return false
+			}
 
-			fmt.Printf(
-				"[FAIL] Could not send AGE key: %v\n",
-				err,
-			)
-			return
-		}
+			if _, err := ageInput.Write(ageData); err != nil {
+				ageSession.Close()
 
-		_ = ageInput.Close()
+				fmt.Printf(
+					"[FAIL] Could not send AGE key: %v\n",
+					err,
+				)
+				return false
+			}
 
-		if err := ageSession.Wait(); err != nil {
-			fmt.Printf(
-				"[FAIL] AGE key transfer failed: %v\n",
-				err,
-			)
-			return
-		}
+			_ = ageInput.Close()
 
-		
+			if err := ageSession.Wait(); err != nil {
+				fmt.Printf(
+					"[FAIL] AGE key transfer failed: %v\n",
+					err,
+				)
+				return false
+			}
 
-		if out, err := sudoRun(
-			client,
-			password,
-			"mkdir -p /root/.config/sops/age && "+
-				"install -m 600 /tmp/homelab-age-keys.txt "+
-				"/root/.config/sops/age/keys.txt && "+
-				"rm -f /tmp/homelab-age-keys.txt",
-		); err != nil {
-			fmt.Printf(
-				"[FAIL] Could not install AGE key: %v\n%s\n",
-				err,
-				out,
-			)
-			return
-		}
+			if out, err := sudoRun(
+				client,
+				password,
+				"mkdir -p /root/.config/sops/age && "+
+					"install -m 600 /tmp/homelab-age-keys.txt "+
+					"/root/.config/sops/age/keys.txt && "+
+					"rm -f /tmp/homelab-age-keys.txt",
+			); err != nil {
+				fmt.Printf(
+					"[FAIL] Could not install AGE key: %v\n%s\n",
+					err,
+					out,
+				)
+				return false
+			}
 
-		fmt.Println("[ OK ] AGE private key installed.")
-		fmt.Println()
+			fmt.Println("[ OK ] AGE private key installed.")
+			fmt.Println()
 
 		}
 
@@ -800,7 +840,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not create execution session: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		fd := int(os.Stdin.Fd())
@@ -834,10 +874,8 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not allocate remote terminal: %v\n",
 				err,
 			)
-			return
+			return false
 		}
-
-		ranRemote = true
 
 		runStdin, err := runSession.StdinPipe()
 
@@ -848,7 +886,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 				"[FAIL] Could not open remote input: %v\n",
 				err,
 			)
-			return
+			return false
 		}
 
 		runSession.Stdout = os.Stdout
@@ -900,7 +938,7 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			)
 
 			runSession.Close()
-			return
+			return false
 		}
 
 		runSession.Close()
@@ -910,11 +948,9 @@ func runRemoteOperation(app *tview.Application, op operation) {
 			"[ OK ] Remote %s operation completed.\n",
 			remoteScript,
 		)
-	})
+	}
 
-	// IMPORTANT:
-	// Do NOT read os.Stdin here.
-	// app.Suspend() returns to the TUI automatically.
+	return true
 }
 
 func getSSHHostFingerprint(
@@ -976,7 +1012,6 @@ func getSSHHostFingerprint(
 		nil
 }
 
-
 func connectSSHWithPassword(
 	host string,
 	port int,
@@ -1030,7 +1065,6 @@ func connectSSHWithPassword(
 	)
 }
 
-
 func sshOutput(
 	client *ssh.Client,
 	command string,
@@ -1050,7 +1084,6 @@ func sshOutput(
 		string(output),
 	), err
 }
-
 
 func sshRun(
 	client *ssh.Client,
@@ -1073,7 +1106,6 @@ func sshRun(
 
 	return session.Run(command)
 }
-
 
 func copyRepositoryOverSSH(
 	client *ssh.Client,
@@ -1130,7 +1162,6 @@ func copyRepositoryOverSSH(
 	return tarErr
 }
 
-
 func copyFileOverSSH(
 	client *ssh.Client,
 	localFile string,
@@ -1167,7 +1198,6 @@ func copyFileOverSSH(
 
 	return session.Run(command)
 }
-
 
 // readEnvFileValue returns NAME from a simple KEY="value" env file ("" if absent).
 func readEnvFileValue(path, name string) string {
@@ -1879,7 +1909,9 @@ func detailText(op operation) string {
 	b.WriteString(fmt.Sprintf("\n  [yellow::b]%s[-::-]\n", op.Title))
 	b.WriteString(fmt.Sprintf("  %s\n\n", op.Desc))
 	b.WriteString(fmt.Sprintf("  MODE  %s\n\n", modeText()))
-	if dryRun {
+	if op.ReadOnly {
+		b.WriteString("  [green]READ-ONLY: ENTER runs this in any mode; it changes nothing.[-]\n\n")
+	} else if dryRun {
 		b.WriteString("  [green]DRY-RUN: the following commands would be executed:[-]\n\n")
 	} else {
 		b.WriteString("  [red]LIVE: ENTER runs the homelabCD installer operation.[-]\n\n")
@@ -1890,67 +1922,85 @@ func detailText(op operation) string {
 	return b.String()
 }
 
-func footerText(page string) string {
-	if page == "detail" && !dryRun {
+func footerText(page string, op operation) string {
+	if page == "detail" && (!dryRun || op.ReadOnly) {
 		return " [aqua::b]ENTER[-::-] Execute    [aqua::b]ESC[-::-] Back    [aqua::b]Q[-::-] Quit"
 	}
 	return " [aqua::b]UP/DOWN[-::-] Navigate    [aqua::b]ENTER[-::-] Select    [aqua::b]ESC[-::-] Back    [aqua::b]Q[-::-] Quit"
 }
 
+// version is set at build time: -ldflags "-X main.version=v1.2.3".
+var version = "dev"
+
+// openRemoteJoin is set in main; it shows the remote-join form for op.
+var openRemoteJoin func(op operation)
+
 func runOperation(app *tview.Application, op operation) {
 
+	// Remote joins: a form, then the join runs in the embedded terminal.
 	if strings.HasPrefix(op.Op, "remote-") {
-		runRemoteOperation(app, op)
+		openRemoteJoin(op)
 		return
 	}
 
-	install := installerPath()
-
-	app.Suspend(func() {
-
-		fmt.Printf("\n=== %s ===\n\n", op.Title)
-
-		if install == "" {
-
-			fmt.Println(
-				"HOMELABCD_INSTALL is not set. Launch this TUI from homelabCD install.sh.",
-			)
-
-		} else {
-
-			cmd := exec.Command(
-				"bash",
-				install,
-				"--run",
-				op.Op,
-			)
-
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			cmd.Env = os.Environ()
-
-			if err := cmd.Run(); err != nil {
-				fmt.Printf(
-					"\n[FAIL] %s: %v\n",
-					op.Op,
-					err,
-				)
-			}
-		}
-
-		fmt.Print("\nPress Enter to return to KubesTUI...")
-
-		_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
-	})
+	tuiRunner.start(op)
 }
 
 func main() {
+	// Docker Compose import/removal, run by install.sh on a control plane.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "compose-import":
+			os.Exit(runComposeImport())
+		case "compose-remove":
+			os.Exit(runComposeRemove())
+		}
+	}
+
+	// Subprocess mode: run a remote join on the embedded terminal.
+	if op := os.Getenv(remoteOpEnv); op != "" {
+		os.Unsetenv(remoteOpEnv)
+		os.Exit(runRemoteHeadless(op))
+	}
+
+	// --node hands over to kbtui before the terminal is touched.
+	if !nodeMode() && startupMode(os.Args[1:]) == modeNode {
+		openNodeMenu()
+	}
+
 	loadCluster()
 	useASCIIBorders()
 
 	app := tview.NewApplication()
+	if screen, err := tcell.NewScreen(); err == nil {
+		app.SetScreen(screen)
+		uiScreen = screen
+	}
+	uiApp = app
+
+	// Not launched by homelabCD's install.sh: a workstation, unless this
+	// Linux machine is a cluster node, in which case ask (see mode.go).
+	if !nodeMode() {
+		useASCIIBorders()
+		switch startupMode(os.Args[1:]) {
+		case modeAsk:
+			chooseMode(app)
+		default:
+			w := setupWorkstation(app)
+			if hasArg(os.Args[1:], "--demo") {
+				w.openDemo()
+			}
+		}
+		if err := app.Run(); err != nil {
+			panic(err)
+		}
+		if launchNodeMenu {
+			openNodeMenu()
+		}
+		return
+	}
 	pages := tview.NewPages()
+	uiPages = pages
 
 	info := tview.NewTextView().SetDynamicColors(true)
 	info.SetText(infoText())
@@ -1969,16 +2019,16 @@ func main() {
 	detail.SetBorder(true).SetTitle(" OPERATION ").SetTitleAlign(tview.AlignLeft)
 
 	footer := tview.NewTextView().SetDynamicColors(true)
-	footer.SetText(footerText("main"))
-
 	var selected operation
+
+	footer.SetText(footerText("main", selected))
 
 	showDetail := func(op operation) {
 		selected = op
 		detail.SetText(detailText(op))
 		detail.ScrollToBeginning()
 		pages.SwitchToPage("detail")
-		footer.SetText(footerText("detail"))
+		footer.SetText(footerText("detail", selected))
 		app.SetFocus(detail)
 	}
 
@@ -1986,6 +2036,8 @@ func main() {
 		op := op
 		list.AddItem("  "+op.Title, "", 0, func() { showDetail(op) })
 	}
+	list.AddItem("  SSH Console", "", 0, func() { sshPage.Show() })
+	list.AddItem("  Share KubesTUI with a Workstation", "", 0, func() { sharer.Start() })
 	list.AddItem("  "+toggleTitle, "", 0, func() {
 		dryRun = !dryRun
 		info.SetText(infoText())
@@ -2011,18 +2063,50 @@ func main() {
 	pages.AddPage("main", mainScreen, true, true)
 	pages.AddPage("detail", detailScreen, true, false)
 
+	backToDetail := func(op operation) {
+		pages.SwitchToPage("detail")
+		footer.SetText(footerText("detail", op))
+		app.SetFocus(detail)
+	}
+	backToMain := func() {
+		pages.SwitchToPage("main")
+		footer.SetText(footerText("main", selected))
+		app.SetFocus(list)
+	}
+
+	tuiRunner = newRunner(app, pages, footer, backToDetail)
+	termPage = newTermScreen(app, pages, footer)
+	sshPage = newSSHConsole(app, pages, footer, backToMain)
+	sharer = newSharePage(app, pages, footer, backToMain)
+	openRemoteJoin = func(op operation) {
+		back := func() { backToDetail(op) }
+		showRemoteJoinForm(app, pages, footer, op, back, launchLocalJoin(back))
+	}
+
 	app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 		name, _ := pages.GetFrontPage()
+		switch name {
+		case "run":
+			return tuiRunner.handleKey(ev)
+		case "term":
+			return termPage.HandleKey(ev)
+		case "ssh":
+			return sshPage.HandleKey(ev)
+		case "share":
+			return sharer.HandleKey(ev)
+		case "sshform", "rjform", "ask":
+			return ev // the form handles its own keys; ESC cancels it
+		}
 		switch ev.Key() {
 		case tcell.KeyEscape:
 			if name != "main" {
 				pages.SwitchToPage("main")
-				footer.SetText(footerText("main"))
+				footer.SetText(footerText("main", selected))
 				app.SetFocus(list)
 				return nil
 			}
 		case tcell.KeyEnter:
-			if name == "detail" && !dryRun {
+			if name == "detail" && (!dryRun || selected.ReadOnly) {
 				runOperation(app, selected)
 				return nil
 			}
