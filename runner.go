@@ -55,6 +55,7 @@ type termBuffer struct {
 	mu        sync.Mutex
 	lines     []string // committed, already translated
 	plain     []string // the same lines as plain text, for copy/save
+	sshKey    string   // last public SSH key seen in the output
 	current   []rune   // raw text of the line being written
 	crPending bool
 	dirty     bool
@@ -94,6 +95,9 @@ func (b *termBuffer) commitLocked() {
 	raw := string(b.current)
 	b.lines = append(b.lines, translateLine(raw))
 	b.plain = append(b.plain, plainLine(raw))
+	if k := sshPublicKey.FindString(b.plain[len(b.plain)-1]); k != "" {
+		b.sshKey = strings.TrimSpace(k)
+	}
 	b.current = b.current[:0]
 	if len(b.lines) > maxOutputLines {
 		b.lines = b.lines[len(b.lines)-maxOutputLines:]
@@ -112,6 +116,13 @@ func (b *termBuffer) appendMarkup(line, plain string) {
 	b.lines = append(b.lines, line)
 	b.plain = append(b.plain, plain)
 	b.dirty = true
+}
+
+// lastSSHKey returns the most recent public SSH key printed, if any.
+func (b *termBuffer) lastSSHKey() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sshKey
 }
 
 // text returns the whole output as plain text.
@@ -166,6 +177,7 @@ type runner struct {
 	elapsed   time.Duration
 	status    string // markup for the status badge
 	notice    string // short message in the header ("Saved log to ...")
+	shownKey  string // SSH key the user was told about
 	follow    bool
 	lastRow   int
 	lastCols  int
@@ -222,10 +234,28 @@ func newRunner(app *tview.Application, pages *tview.Pages, footer *tview.TextVie
 }
 
 func (r *runner) footerText() string {
-	if r.running {
-		return " [aqua::b]ENTER[-::-] Send input    [aqua::b]PGUP/PGDN[-::-] Scroll    [aqua::b]END[-::-] Follow    [aqua::b]CTRL+C[-::-] Interrupt"
+	key := ""
+	if r.buf != nil && r.buf.lastSSHKey() != "" {
+		key = "    [aqua::b]CTRL+K[-::-] Copy SSH key"
 	}
-	return " [aqua::b]ESC[-::-] Back    [aqua::b]R[-::-] Run again    [aqua::b]UP/DOWN/PGUP/PGDN[-::-] Scroll    [aqua::b]Y[-::-] Copy all    [aqua::b]S[-::-] Save log    [aqua::b]Q[-::-] Quit"
+	if r.running {
+		return " [aqua::b]ENTER[-::-] Send input    [aqua::b]PGUP/PGDN[-::-] Scroll    [aqua::b]CTRL+Y[-::-] Copy all" + key + "    [aqua::b]CTRL+C[-::-] Interrupt"
+	}
+	return " [aqua::b]ESC[-::-] Back    [aqua::b]R[-::-] Run again    [aqua::b]PGUP/PGDN[-::-] Scroll    [aqua::b]Y[-::-] Copy all" + key + "    [aqua::b]S[-::-] Save log    [aqua::b]Q[-::-] Quit"
+}
+
+// sshPublicKey matches an OpenSSH public key line (e.g. a deploy key the
+// bootstrap asks you to add to GitHub).
+var sshPublicKey = regexp.MustCompile(`(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp\d+|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]{40,}={0,3}(?: [^\s]+)?`)
+
+// copyText copies to the clipboard and reports it in the header.
+func (r *runner) copyText(text, what string) {
+	if copyToClipboard(text) {
+		r.notice = "Copied " + what + " to the clipboard"
+	} else {
+		r.notice = "Clipboard unavailable; press S when finished to save the log"
+	}
+	r.header.SetText(r.headerText())
 }
 
 func (r *runner) headerText() string {
@@ -267,6 +297,7 @@ func (r *runner) send(s string) {
 func (r *runner) start(op operation) {
 	r.op = op
 	r.notice = ""
+	r.shownKey = ""
 	r.buf = &termBuffer{}
 	r.follow = true
 	r.lastRow = 0
@@ -401,6 +432,13 @@ func (r *runner) tick() {
 	}
 	r.lastRow, _ = r.output.GetScrollOffset()
 
+	// A public SSH key was printed (e.g. the GitHub deploy key): offer it.
+	if k := r.buf.lastSSHKey(); k != "" && k != r.shownKey {
+		r.shownKey = k
+		r.notice = "SSH key shown: press Ctrl+K to copy it"
+		r.footer.SetText(r.footerText())
+	}
+
 	r.header.SetText(r.headerText())
 
 	// Mask the input bar while the program has echo off (passwords).
@@ -497,6 +535,15 @@ func (r *runner) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 	}
 
 	switch ev.Key() {
+	case tcell.KeyCtrlK:
+		if k := r.buf.lastSSHKey(); k != "" {
+			r.copyText(k, "the SSH key")
+		}
+		return nil
+	case tcell.KeyCtrlY:
+		text := r.buf.text()
+		r.copyText(text, fmt.Sprintf("%d lines", strings.Count(text, "\n")))
+		return nil
 	case tcell.KeyCtrlC:
 		if r.running {
 			r.send("\x03")
