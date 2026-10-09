@@ -301,6 +301,9 @@ func (v *logView) ScrollBy(n int) {
 	v.follow = v.top >= v.maxTop()
 }
 
+// HasSelection reports whether text is selected (and not still being dragged).
+func (v *logView) HasSelection() bool { return v.hasSel && !v.selecting }
+
 func (v *logView) ScrollToBeginning() { v.top, v.follow = 0, false }
 func (v *logView) ScrollToEnd()       { v.follow = true }
 func (v *logView) Following() bool    { return v.follow }

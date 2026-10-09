@@ -503,7 +503,10 @@ func remoteFlow(opName string, pre remotePrefill) bool {
 			client,
 			password,
 			fmt.Sprintf(
-				"mkdir -p %s && chown %s: %s",
+				// -R: a previous run's installer (run with sudo) leaves
+				// root-owned files, e.g. generated/, that the copy below
+				// (run as the SSH user) could not overwrite.
+				"mkdir -p %s && chown -R %s: %s",
 				shellQuote(remoteRoot),
 				shellQuote(remoteUser),
 				shellQuote(remoteRoot),

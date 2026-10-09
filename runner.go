@@ -647,6 +647,13 @@ func (r *runner) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 		r.copyText(text, fmt.Sprintf("%d lines", strings.Count(text, "\n")))
 		return nil
 	case tcell.KeyCtrlC:
+		// With text selected, Ctrl+C copies it (like Windows Terminal)
+		// instead of interrupting, e.g. when copying the deploy key.
+		if r.output.HasSelection() {
+			text := r.output.SelectionText()
+			r.copyText(text, fmt.Sprintf("%d line(s)", strings.Count(text, "\n")+1))
+			return nil
+		}
 		if r.running {
 			r.send("\x03")
 		}
