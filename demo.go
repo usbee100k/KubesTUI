@@ -38,6 +38,7 @@ func (d *demoBackend) Write(b []byte) (int, error) {
 
 func (d *demoBackend) Resize(cols, rows int) {}
 func (d *demoBackend) Hangup()               { d.once.Do(func() { close(d.done) }) }
+func (d *demoBackend) Kill()                 { d.Hangup() }
 
 // demoTerm is what a demo script talks to. Output needs \r\n (there is no
 // terminal driver to translate \n), which Print adds.

@@ -52,6 +52,7 @@ type termView struct {
 	rows     int
 	running  bool
 	exitCode int
+	lost     atomic.Bool // the SSH connection stopped answering
 
 	dirty  atomic.Bool
 	stop   chan struct{}
@@ -125,6 +126,8 @@ type termBackend interface {
 	io.Writer
 	Resize(cols, rows int)
 	Hangup()
+	// Kill ends the session by force when Hangup wasn't enough.
+	Kill()
 }
 
 type ptyBackend struct {
@@ -141,19 +144,93 @@ func (p *ptyBackend) Hangup() {
 		hangupSession(p.cmd.Process.Pid)
 	}
 }
+func (p *ptyBackend) Kill() {
+	if p.cmd.Process != nil {
+		killSession(p.cmd.Process.Pid)
+	}
+	_ = p.master.Close()
+}
 
 type sshBackend struct {
 	client  *ssh.Client
 	session *ssh.Session
 	stdin   io.WriteCloser
+	keys    chan []byte // typed keys, written by sendKeys
+	closed  chan struct{}
+	once    sync.Once
 }
 
-func (s *sshBackend) Write(b []byte) (int, error) { return s.stdin.Write(b) }
-func (s *sshBackend) Resize(cols, rows int)       { _ = s.session.WindowChange(rows, cols) }
+// Write queues keys for the session. Writing happens on another goroutine,
+// so a stalled connection can never freeze the UI.
+func (s *sshBackend) Write(b []byte) (int, error) {
+	c := append([]byte(nil), b...)
+	select {
+	case s.keys <- c:
+	case <-s.closed:
+	default: // the connection isn't taking input; drop rather than block
+	}
+	return len(b), nil
+}
+
+func (s *sshBackend) sendKeys() {
+	for {
+		select {
+		case b := <-s.keys:
+			if _, err := s.stdin.Write(b); err != nil {
+				return
+			}
+		case <-s.closed:
+			return
+		}
+	}
+}
+
+func (s *sshBackend) Resize(cols, rows int) {
+	go func() { _ = s.session.WindowChange(rows, cols) }()
+}
+
 func (s *sshBackend) Hangup() {
-	_ = s.session.Signal(ssh.SIGHUP)
-	_ = s.session.Close()
+	s.once.Do(func() { close(s.closed) })
+	// Each step can stall on a dead connection; closing the client last
+	// always ends the session.
+	go func() {
+		_ = s.session.Signal(ssh.SIGHUP)
+		_ = s.session.Close()
+	}()
 	_ = s.client.Close()
+}
+func (s *sshBackend) Kill() { s.Hangup() }
+
+// sshKeepalive closes client when the other side stops answering (device
+// off, network gone), so a dead session ends instead of hanging forever.
+// lost is set when that happens.
+func sshKeepalive(client *ssh.Client, lost *atomic.Bool) {
+	const every, misses = 10 * time.Second, 3
+	go func() {
+		failed := 0
+		for {
+			time.Sleep(every)
+			reply := make(chan error, 1)
+			go func() {
+				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+				reply <- err
+			}()
+			select {
+			case err := <-reply:
+				if err != nil {
+					return // the client was closed
+				}
+				failed = 0
+			case <-time.After(every):
+				failed++
+				if failed >= misses {
+					lost.Store(true)
+					_ = client.Close()
+					return
+				}
+			}
+		}
+	}()
 }
 
 // begin resets the emulator for a new session writing replies to w.
@@ -329,8 +406,12 @@ func (t *termView) StartSSH(client *ssh.Client, command string, onExit func(code
 		return err
 	}
 
-	backend := &sshBackend{client: client, session: session, stdin: stdin}
-	vt := t.begin(stdin, onExit)
+	backend := &sshBackend{client: client, session: session, stdin: stdin,
+		keys: make(chan []byte, 256), closed: make(chan struct{})}
+	go backend.sendKeys()
+	sshKeepalive(client, &t.lost)
+	// The emulator's replies (cursor reports etc.) go through the same queue.
+	vt := t.begin(backend, onExit)
 	t.mu.Lock()
 	t.backend = backend
 	t.mu.Unlock()
@@ -393,15 +474,27 @@ func (t *termView) Send(b []byte) {
 	}
 }
 
-// Close hangs up the session (like closing a terminal window).
+// Close hangs up the session (like closing a terminal window). If it is
+// still running 3 seconds later it is killed.
 func (t *termView) Close() {
 	t.mu.Lock()
 	backend, running := t.backend, t.running
 	t.mu.Unlock()
-	if running && backend != nil {
-		backend.Hangup()
+	if !running || backend == nil {
+		return
 	}
+	backend.Hangup()
+	go func() {
+		time.Sleep(3 * time.Second)
+		if t.Running() {
+			backend.Kill()
+		}
+	}()
 }
+
+// ConnectionLost reports whether the session ended because the SSH
+// connection stopped answering.
+func (t *termView) ConnectionLost() bool { return t.lost.Load() }
 
 func vtColor(c vt10x.Color) tcell.Color {
 	switch {

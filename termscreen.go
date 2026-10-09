@@ -57,12 +57,37 @@ type termScreen struct {
 	startedAt  time.Time
 	ended      bool
 	endCode    int
-	closed     bool // ended because the user pressed Ctrl+]
+	closed     bool // ended because the user closed it (Ctrl+] / Esc Esc Esc)
 	connecting bool
 	ticker     chan struct{}
 
 	noticeText  string
 	noticeUntil time.Time
+
+	escs closeKeys // Esc Esc Esc closes the session
+}
+
+// closeKeys detects Esc pressed three times within a second: a way to
+// close a session that works on every keyboard layout (Ctrl+] needs a
+// "]" key, which many layouts only have behind AltGr).
+type closeKeys struct {
+	times [3]time.Time
+	n     int
+}
+
+func (c *closeKeys) press(ev *tcell.EventKey) bool {
+	if ev.Key() != tcell.KeyEscape {
+		c.n = 0
+		return false
+	}
+	now := time.Now()
+	c.times[c.n%3] = now
+	c.n++
+	if c.n >= 3 && now.Sub(c.times[(c.n)%3]) < time.Second {
+		c.n = 0
+		return true
+	}
+	return false
 }
 
 func newTermScreen(app *tview.Application, pages *tview.Pages, footer *tview.TextView) *termScreen {
@@ -93,6 +118,10 @@ func (s *termScreen) statusText() string {
 		return fmt.Sprintf(" [black:green:b] ● LIVE [-:-:-]  [white::b]%s[-::-]   [gray]%s[-]",
 			tview.Escape(s.launch.target), elapsed)
 	}
+	if s.tv.ConnectionLost() {
+		return fmt.Sprintf(" [white:red:b] ✗ CONNECTION LOST [-:-:-]  [white::b]%s[-::-]   [gray]no reply for 30s; the device is off or unreachable[-]",
+			tview.Escape(s.launch.target))
+	}
 	if s.closed {
 		return fmt.Sprintf(" [black:gray:b] ■ CLOSED [-:-:-]  [white::b]%s[-::-]   [gray]%s[-]",
 			tview.Escape(s.launch.target), elapsed)
@@ -116,7 +145,7 @@ func (s *termScreen) footerText() string {
 	case s.connecting:
 		return " [aqua::b]ESC[-::-] Cancel"
 	case !s.ended:
-		return " [aqua::b]CTRL+][-::-] Close    [aqua::b]SHIFT+PGUP[-::-] Scrollback    [aqua::b]DRAG[-::-] Copy    [gray]Other keys go to the terminal[-]"
+		return " [aqua::b]CTRL+][-::-] or [aqua::b]ESC ESC ESC[-::-] Close    [aqua::b]SHIFT+PGUP[-::-] Scrollback    [aqua::b]DRAG[-::-] Copy    [gray]Other keys go to the terminal[-]"
 	}
 	return " [aqua::b]ESC/ENTER[-::-] Back    [aqua::b]R[-::-] Run again    [aqua::b]SHIFT+PGUP[-::-] Scroll    [aqua::b]Y[-::-] Copy all    [aqua::b]S[-::-] Save log"
 }
@@ -217,11 +246,14 @@ func (s *termScreen) Open(l termLaunch, onBack func()) {
 	}
 
 	onExit := func(code int) {
-		if s.tv != tv {
-			return // a newer session replaced this one
+		if s.tv != tv || s.ended {
+			return // replaced by a newer session, or already closed by force
 		}
 		s.ended = true
 		s.endCode = code
+		if s.noticeText == "Closing..." {
+			s.noticeText = ""
+		}
 		s.stopTicker()
 		s.refresh()
 		if l.onFinish != nil {
@@ -300,6 +332,28 @@ func (s *termScreen) Open(l termLaunch, onBack func()) {
 	}()
 }
 
+// closeSession hangs up the session. If it still hasn't ended after 6
+// seconds (a stuck process or connection), the screen is released anyway.
+func (s *termScreen) closeSession() {
+	s.closed = true
+	s.notify("Closing...")
+	tv := s.tv
+	tv.Close()
+	go func() {
+		time.Sleep(6 * time.Second)
+		s.app.QueueUpdateDraw(func() {
+			if s.tv == tv && !s.ended {
+				s.ended, s.endCode = true, -1
+				s.stopTicker()
+				s.notify("The session did not respond; closed it anyway")
+				if s.launch.onFinish != nil {
+					s.launch.onFinish(-1)
+				}
+			}
+		})
+	}()
+}
+
 func (s *termScreen) stopTicker() {
 	if s.ticker != nil {
 		close(s.ticker)
@@ -354,10 +408,11 @@ func (s *termScreen) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 	}
 
 	if !s.ended {
-		// Ctrl+] (like telnet) is the one key that never reaches the session.
-		if ev.Key() == tcell.KeyCtrlRightSq {
-			s.closed = true
-			s.tv.Close()
+		// Ctrl+] (like telnet) never reaches the session. Esc Esc Esc
+		// closes it too (the Escs are still sent, for vim and friends).
+		triple := s.escs.press(ev)
+		if ev.Key() == tcell.KeyCtrlRightSq || triple {
+			s.closeSession()
 			return nil
 		}
 		s.tv.HandleKey(ev)
@@ -381,4 +436,35 @@ func (s *termScreen) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 		}
 	}
 	return nil
+}
+
+// lastCtrlQ is when Ctrl+Q was last pressed (see emergencyQuit).
+var lastCtrlQ time.Time
+
+// emergencyQuit quits KubesTUI from any screen when Ctrl+Q is pressed twice
+// within 1.5 seconds, even in the middle of a session or an operation
+// (the first press still goes where it normally would). Running sessions
+// and operations are ended first.
+func emergencyQuit(app *tview.Application, ev *tcell.EventKey) bool {
+	if ev.Key() != tcell.KeyCtrlQ {
+		return false
+	}
+	now := time.Now()
+	if now.Sub(lastCtrlQ) > 1500*time.Millisecond {
+		lastCtrlQ = now
+		return false
+	}
+	if tuiRunner != nil && tuiRunner.running {
+		// Hang up, then make sure nothing is left running in the background.
+		hangupSession(tuiRunner.pid)
+		time.Sleep(500 * time.Millisecond)
+		killSession(tuiRunner.pid)
+	}
+	if termPage != nil && termPage.tv != nil {
+		termPage.tv.Close()
+	}
+	// Restoring the terminal can block if it is gone; never wait forever.
+	time.AfterFunc(3*time.Second, func() { os.Exit(1) })
+	app.Stop()
+	return true
 }

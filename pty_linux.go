@@ -62,3 +62,8 @@ func ptyEchoOff(fd int) (off, ok bool) {
 func hangupSession(pid int) {
 	_ = syscall.Kill(-pid, syscall.SIGHUP)
 }
+
+// killSession kills the whole session led by pid.
+func killSession(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+}

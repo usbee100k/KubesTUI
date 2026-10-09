@@ -105,6 +105,9 @@ func setupWorkstation(app *tview.Application) *workstation {
 }
 
 func (w *workstation) capture(ev *tcell.EventKey) *tcell.EventKey {
+	if emergencyQuit(w.app, ev) {
+		return nil
+	}
 	name, _ := w.pages.GetFrontPage()
 	switch name {
 	case "term":

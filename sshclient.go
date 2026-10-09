@@ -390,11 +390,15 @@ func dialSSH(t dialTarget) (*ssh.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A server that accepts the connection but never answers must not
+	// hang the handshake.
+	_ = c.SetDeadline(time.Now().Add(cfg.Timeout))
 	sc, chans, reqs, err := ssh.NewClientConn(c, addr, cfg)
 	if err != nil {
 		c.Close()
 		return nil, err
 	}
+	_ = c.SetDeadline(time.Time{})
 	return ssh.NewClient(sc, chans, reqs), nil
 }
 

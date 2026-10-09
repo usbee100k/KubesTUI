@@ -401,7 +401,11 @@ func sshArgs(e hostEntry) []string {
 	return []string{
 		"-p", strconv.Itoa(e.portOr22()),
 		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "ServerAliveInterval=30",
+		// A device that goes away ends the session within ~30s
+		// instead of leaving it frozen.
+		"-o", "ConnectTimeout=15",
+		"-o", "ServerAliveInterval=10",
+		"-o", "ServerAliveCountMax=3",
 		e.User + "@" + e.Host,
 	}
 }
@@ -481,6 +485,7 @@ func (c *sshConsole) setupKey(e hostEntry) {
 			"-i", key + ".pub",
 			"-p", strconv.Itoa(e.portOr22()),
 			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "ConnectTimeout=15",
 			e.User + "@" + e.Host,
 		},
 		env:    termEnv(),

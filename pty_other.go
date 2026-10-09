@@ -25,3 +25,5 @@ func ptySetSize(fd, cols, rows int) {}
 func ptyEchoOff(fd int) (off, ok bool) { return false, false }
 
 func hangupSession(pid int) {}
+
+func killSession(pid int) {}

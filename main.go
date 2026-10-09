@@ -2084,6 +2084,9 @@ func main() {
 	}
 
 	app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		if emergencyQuit(app, ev) {
+			return nil
+		}
 		name, _ := pages.GetFrontPage()
 		switch name {
 		case "run":

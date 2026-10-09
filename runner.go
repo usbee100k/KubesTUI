@@ -219,6 +219,9 @@ type runner struct {
 	status    string // markup for the status badge
 	notice    string // short message in the header ("Saved log to ...")
 	shownKey  string // SSH key the user was told about
+	pid       int    // session leader of the running operation
+	gen       int    // increments per run, so a stale finish is ignored
+	escs      closeKeys
 	lastCols  int
 	lastRows  int
 	masked    bool
@@ -297,7 +300,7 @@ func (r *runner) footerText() string {
 		key = "    [aqua::b]CTRL+K[-::-] Copy SSH key"
 	}
 	if r.running {
-		return " [aqua::b]ENTER[-::-] Send input    [aqua::b]PGUP/PGDN[-::-] Scroll    [aqua::b]CTRL+Y[-::-] Copy all" + key + "    [aqua::b]CTRL+C[-::-] Interrupt"
+		return " [aqua::b]ENTER[-::-] Send input    [aqua::b]PGUP/PGDN[-::-] Scroll    [aqua::b]CTRL+Y[-::-] Copy all" + key + "    [aqua::b]CTRL+C[-::-] Interrupt    [aqua::b]ESC ESC ESC[-::-] Force stop"
 	}
 	return " [aqua::b]ESC[-::-] Back    [aqua::b]R[-::-] Run again    [aqua::b]PGUP/PGDN[-::-] Scroll    [aqua::b]Y[-::-] Copy all" + key + "    [aqua::b]S[-::-] Save log    [aqua::b]Q[-::-] Quit"
 }
@@ -397,6 +400,10 @@ func (r *runner) start(op operation) {
 	}
 	slave.Close()
 
+	r.gen++
+	gen := r.gen
+	r.pid = cmd.Process.Pid
+
 	r.mu.Lock()
 	r.master = master
 	r.masterFd = int(master.Fd())
@@ -464,7 +471,11 @@ func (r *runner) start(op operation) {
 			code = -1
 		}
 
-		r.app.QueueUpdateDraw(func() { r.finish(buf, code) })
+		r.app.QueueUpdateDraw(func() {
+			if r.gen == gen && r.running { // not already stopped by force
+				r.finish(buf, code)
+			}
+		})
 	}()
 }
 
@@ -530,6 +541,13 @@ func (r *runner) finish(buf *termBuffer, code int) {
 		r.status = "[black:green:b] COMPLETED [-:-:-]"
 		line = fmt.Sprintf("-- Completed in %s --", formatElapsed(r.elapsed))
 		st = st.Foreground(tcell.ColorGreen)
+	case code == 129 || code == 137: // hung up / killed (force stop)
+		r.status = "[black:yellow:b] STOPPED [-:-:-]"
+		if r.notice == "Stopping..." {
+			r.notice = ""
+		}
+		line = "-- Stopped --"
+		st = st.Foreground(tcell.ColorYellow)
 	case code == 130:
 		r.status = "[black:yellow:b] INTERRUPTED [-:-:-]"
 		line = "-- Interrupted --"
@@ -569,12 +587,53 @@ func (r *runner) finishNow(status, message string) {
 
 func (r *runner) scrollBy(delta int) { r.output.ScrollBy(delta) }
 
+// forceStop ends a stuck operation: hang up (like closing the terminal),
+// kill it 3 seconds later, and if even that doesn't end it, release the
+// screen anyway. UI goroutine.
+func (r *runner) forceStop() {
+	if !r.running {
+		return
+	}
+	gen, pid, buf := r.gen, r.pid, r.buf
+	r.notice = "Stopping..."
+	r.header.SetText(r.headerText())
+	hangupSession(pid)
+
+	later := func(d time.Duration, fn func()) {
+		time.AfterFunc(d, func() {
+			r.app.QueueUpdateDraw(func() {
+				if r.gen == gen && r.running {
+					fn()
+				}
+			})
+		})
+	}
+	later(3*time.Second, func() {
+		killSession(pid)
+		r.mu.Lock()
+		if r.master != nil {
+			_ = r.master.Close()
+		}
+		r.mu.Unlock()
+	})
+	later(6*time.Second, func() {
+		r.notice = "The operation did not respond; stopped waiting for it"
+		r.finish(buf, 137)
+	})
+}
+
 // handleKey is the runner page's input capture. UI goroutine.
 func (r *runner) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 	_, _, _, h := r.output.GetInnerRect()
 	page := h - 1
 	if page < 1 {
 		page = 1
+	}
+
+	// Ctrl+] or Esc Esc Esc force-stops a stuck operation.
+	if triple := r.escs.press(ev); r.running && (triple || ev.Key() == tcell.KeyCtrlRightSq) {
+		r.forceStop()
+		return nil
 	}
 
 	switch ev.Key() {
