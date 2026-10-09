@@ -164,6 +164,14 @@ var operations = []operation{
 		},
 		ReadOnly: true,
 	},
+	{
+		Title: "Update homelabCD and KubesTUI",
+		Desc:  "Pull the latest homelabCD from GitHub (your saved settings in config/ are kept) and rebuild KubesTUI. Doesn't change the cluster. Reopen KubesTUI (kbtui) afterwards to use the new version.",
+		Op:    "update",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run update",
+		},
+	},
 }
 
 const toggleTitle = "Toggle Dry-Run / Live"
@@ -1599,10 +1607,17 @@ func generateJoinCommand(
 
 	const tokenCmd = "kubeadm token create --ttl 2h --print-join-command"
 
-	host := strings.TrimSpace(readRemoteValue(
-		reader,
-		"Control plane address (blank = this machine): ",
-	))
+	// The token comes from an existing control plane. Running on one (the
+	// usual case), use it without asking; otherwise ask which one.
+	host := ""
+
+	if _, err := os.Stat("/etc/kubernetes/admin.conf"); err != nil {
+		fmt.Println("The join token is created on an existing control plane of the cluster.")
+		host = strings.TrimSpace(readRemoteValue(
+			reader,
+			"Existing control plane to create the token on (IP/hostname, blank = this machine): ",
+		))
+	}
 
 	var output string
 

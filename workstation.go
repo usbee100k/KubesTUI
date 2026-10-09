@@ -556,6 +556,7 @@ func (w *workstation) actions() []wsAction {
 		{title: "Open Shell on Control Plane", desc: "A terminal on " + w.current.Host, run: w.openShell},
 		{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
 		{title: "Use kubectl from This Computer", desc: "kubeconfig location and commands for kubectl, k9s or Lens", run: w.showKubectl},
+		{title: "Update homelabCD and KubesTUI", desc: "Pull the latest homelabCD and rebuild KubesTUI on " + w.current.Host + " (settings are kept)", op: "update", confirm: true},
 		{title: "Back to Clusters", desc: "", run: w.showHome},
 	}
 }
