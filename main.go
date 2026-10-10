@@ -38,8 +38,8 @@ type operation struct {
 	ReadOnly bool // safe to run in dry-run mode: changes nothing
 }
 
+// Name comes from homelabCD's config/cluster.yaml (see loadCluster).
 var cluster = clusterInfo{
-	Name:    "homelab",
 	Version: "v1.36.2",
 	VIP:     "192.168.50.222",
 	Runtime: "containerd",
@@ -163,6 +163,14 @@ var operations = []operation{
 			"${HOMELABCD_INSTALL} --run config",
 		},
 		ReadOnly: true,
+	},
+	{
+		Title: "Rename Cluster",
+		Desc:  "Change the cluster name shown here, in the text menu and in reports (cluster.name in config/cluster.yaml). Doesn't touch the running cluster.",
+		Op:    "rename",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run rename",
+		},
 	},
 	{
 		Title: "Update homelabCD and KubesTUI",
@@ -1864,7 +1872,10 @@ func envOr(key, fallback string) string {
 }
 
 func loadCluster() {
-	cluster.Name = envOr("CLUSTER_NAME", cluster.Name)
+	cluster.Name = readClusterName()
+	if cluster.Name == "" {
+		cluster.Name = envOr("CLUSTER_NAME", "unnamed")
+	}
 	cluster.Version = envOr("KUBERNETES_VERSION", cluster.Version)
 	cluster.VIP = envOr("VIP_ADDRESS", cluster.VIP)
 	cluster.Runtime = envOr("CONTAINER_RUNTIME", cluster.Runtime)
@@ -2069,14 +2080,27 @@ func main() {
 		info.SetText(infoText())
 	})
 
+	// Header: cluster info on the left, live node lights on the right.
+	activity := newActivityPanel(app)
+	top := tview.NewFlex().
+		AddItem(info, 36, 0, false).
+		AddItem(activity.view, 0, 1, false)
+
 	body := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(nil, 1, 0, false).
-		AddItem(info, 6, 0, false).
+		AddItem(top, 6, 0, false).
 		AddItem(opsHeader, 2, 0, false).
 		AddItem(list, 0, 1, true)
 	body.SetBorder(true).
-		SetTitle(" HOMELAB KUBERNETES PLATFORM ").
+		SetTitle(platformTitle()).
 		SetTitleAlign(tview.AlignLeft)
+
+	activity.onRefresh = func(lines int) {
+		body.ResizeItem(top, max(6, lines), 0)
+		body.SetTitle(platformTitle())
+		info.SetText(infoText())
+	}
+	activity.Start()
 
 	mainScreen := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(body, 0, 1, true).

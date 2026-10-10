@@ -135,7 +135,8 @@ func clusterNodes() ([]nodeRow, error) {
 
 	out, err := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", "json").Output()
 	if err != nil {
-		return nil, err
+		// Workers can't list nodes themselves: use the node-status agent's copy.
+		return agentNodes()
 	}
 	return parseNodes(out)
 }
@@ -247,7 +248,7 @@ func newSSHConsole(app *tview.Application, pages *tview.Pages, footer *tview.Tex
 		AddItem(c.intro, 5, 0, false).
 		AddItem(c.table, 0, 1, true).
 		AddItem(c.note, 2, 0, false)
-	body.SetBorder(true).SetTitle(" HOMELAB KUBERNETES PLATFORM ").SetTitleAlign(tview.AlignLeft)
+	body.SetBorder(true).SetTitle(platformTitle()).SetTitleAlign(tview.AlignLeft)
 
 	c.screen = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(body, 0, 1, true).

@@ -273,7 +273,7 @@ func newRunner(app *tview.Application, pages *tview.Pages, footer *tview.TextVie
 		AddItem(r.output, 0, 1, false).
 		AddItem(r.input, 1, 0, true)
 	r.body.SetBorder(true).
-		SetTitle(" HOMELAB KUBERNETES PLATFORM ").
+		SetTitle(platformTitle()).
 		SetTitleAlign(tview.AlignLeft)
 
 	// Click anywhere while it's running to type an answer: focus goes to
@@ -365,6 +365,7 @@ func (r *runner) start(op operation) {
 	r.input.SetText("").SetLabel("  INPUT > ").SetMaskCharacter(0)
 	r.output.Reset()
 	r.body.ResizeItem(r.input, 1, 0)
+	r.body.SetTitle(platformTitle()) // the cluster may have been renamed
 
 	r.pages.AddAndSwitchToPage("run", r.screen, true)
 
