@@ -172,6 +172,14 @@ var operations = []operation{
 			"${HOMELABCD_INSTALL} --run update",
 		},
 	},
+	{
+		Title: "Update GitOps Templates",
+		Desc:  "Merge this homelabCD version's templates into your GitOps repo. Your edits and saved values (domain, IP pool, subdomains, VPN) are kept; if you and homelabCD changed the same line it stops and shows you where, without changing anything.",
+		Op:    "gitops-update",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run gitops-update",
+		},
+	},
 }
 
 const toggleTitle = "Toggle Dry-Run / Live"
