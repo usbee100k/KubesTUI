@@ -55,6 +55,8 @@ type workstation struct {
 
 	vpn          *vpnPage
 	reachChecked map[string]bool // clusters already checked this session
+
+	pendingNote string // shown on the cluster page when it next opens
 }
 
 // demoActive is true while the demo cluster is open (see demo.go).
@@ -95,6 +97,7 @@ func setupWorkstation(app *tview.Application) *workstation {
 		return currentUsername()
 	}
 
+	cleanupOldBinary()
 	w.buildHome()
 	w.buildCluster()
 	w.showHome()
@@ -560,6 +563,7 @@ func (w *workstation) actions() []wsAction {
 		{title: "Use kubectl from This Computer", desc: "kubeconfig location and commands for kubectl, k9s or Lens", run: w.showKubectl},
 		{title: "Update homelabCD and KubesTUI", desc: "Pull the latest homelabCD and rebuild KubesTUI on " + w.current.Host + " (settings are kept)", op: "update", confirm: true},
 		{title: "Update GitOps Templates", desc: "Merge new homelabCD templates into your GitOps repo; your edits and settings are kept", op: "gitops-update", confirm: true},
+		{title: "Update KubesTUI on This Computer", desc: "Build the newest KubesTUI on " + w.current.Host + " and install it here (" + version + " now)", run: w.selfUpdate},
 		{title: "Back to Clusters", desc: "", run: w.showHome},
 	}
 }
@@ -600,7 +604,8 @@ func (w *workstation) showCluster() {
 	if selected >= 0 && selected < w.clusterList.GetItemCount() {
 		w.clusterList.SetCurrentItem(selected)
 	}
-	w.clusterNote.SetText("")
+	w.clusterNote.SetText(w.pendingNote)
+	w.pendingNote = ""
 
 	w.pages.AddAndSwitchToPage("cluster", w.cluster, true)
 	w.footer.SetText(" [aqua::b]UP/DOWN[-::-] Navigate    [aqua::b]ENTER[-::-] Select    [aqua::b]ESC[-::-] Clusters    [aqua::b]Q[-::-] Quit")

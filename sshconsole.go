@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -312,7 +313,7 @@ func (c *sshConsole) refresh() {
 
 	for i, r := range c.rows {
 		entry := c.store.find(r.host)
-		user, auth, authColor := c.defaultUser(), "password", tcell.ColorYellow
+		user, auth, authColor := c.userFor(&r), "password", tcell.ColorYellow
 		port := 22
 		if entry != nil {
 			if entry.User != "" {
@@ -370,12 +371,31 @@ func (c *sshConsole) current() *nodeRow {
 	return nil
 }
 
+// userFor is the login suggested for a node with no saved login. Homelabs
+// often name each machine's account after the machine (toji@toji): when the
+// default account matches a cluster node's name, other nodes get their own
+// name too, so a worker "mehumi" suggests mehumi rather than toji.
+func (c *sshConsole) userFor(r *nodeRow) string {
+	user := c.defaultUser()
+	if r.custom || !usernameRe.MatchString(r.name) {
+		return user
+	}
+	for _, n := range c.rows {
+		if !n.custom && n.name == user {
+			return r.name
+		}
+	}
+	return user
+}
+
+var usernameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
 func (c *sshConsole) entryFor(r *nodeRow) hostEntry {
-	e := hostEntry{Name: r.name, Host: r.host, User: c.defaultUser(), Custom: r.custom}
+	e := hostEntry{Name: r.name, Host: r.host, User: c.userFor(r), Custom: r.custom}
 	if saved := c.store.find(r.host); saved != nil {
 		e = *saved
 		if e.User == "" {
-			e.User = c.defaultUser()
+			e.User = c.userFor(r)
 		}
 		if e.Name == "" {
 			e.Name = r.name
@@ -394,8 +414,19 @@ func (c *sshConsole) activate(row int) {
 		return
 	}
 	if r := c.current(); r != nil {
-		c.connectFn(c.entryFor(r))
+		c.withLogin(r, c.connectFn)
 	}
+}
+
+// withLogin runs fn with r's login. A node with no saved login asks for it
+// first (prefilled with the suggestion), so a wrong guess never reaches a
+// password prompt.
+func (c *sshConsole) withLogin(r *nodeRow, fn func(e hostEntry)) {
+	if saved := c.store.find(r.host); c.demo || (saved != nil && saved.User != "") {
+		fn(c.entryFor(r))
+		return
+	}
+	c.userForm(r, "Continue", fn)
 }
 
 func sshArgs(e hostEntry) []string {
@@ -528,12 +559,15 @@ func (c *sshConsole) closeDialogAndRefresh() {
 	c.app.SetFocus(c.table)
 }
 
-func (c *sshConsole) userForm(r *nodeRow) {
+// userForm edits r's saved login; then, if set, runs with it after saving.
+func (c *sshConsole) userForm(r *nodeRow, button string, then func(e hostEntry)) {
+	row := *r
+	r = &row
 	e := c.entryFor(r)
 	form := tview.NewForm().
 		AddInputField("SSH user", e.User, 30, nil, nil).
 		AddInputField("SSH port", strconv.Itoa(e.portOr22()), 6, tview.InputFieldInteger, nil)
-	form.AddButton("Save", func() {
+	form.AddButton(button, func() {
 		user := strings.TrimSpace(form.GetFormItemByLabel("SSH user").(*tview.InputField).GetText())
 		port, _ := strconv.Atoi(form.GetFormItemByLabel("SSH port").(*tview.InputField).GetText())
 		if user == "" || port < 1 || port > 65535 {
@@ -542,6 +576,9 @@ func (c *sshConsole) userForm(r *nodeRow) {
 		c.store.upsert(hostEntry{Name: r.name, Host: r.host, User: user, Port: port, Custom: r.custom})
 		_ = c.store.save()
 		c.closeDialogAndRefresh()
+		if then != nil {
+			then(c.entryFor(r))
+		}
 	})
 	c.showDialog(form, "LOGIN FOR "+strings.ToUpper(r.name), 10)
 }
@@ -586,12 +623,12 @@ func (c *sshConsole) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 		switch ev.Rune() {
 		case 'k', 'K':
 			if r != nil {
-				c.keyFn(c.entryFor(r))
+				c.withLogin(r, c.keyFn)
 			}
 			return nil
 		case 'u', 'U':
 			if r != nil {
-				c.userForm(r)
+				c.userForm(r, "Save", nil)
 			}
 			return nil
 		case 'a', 'A':
