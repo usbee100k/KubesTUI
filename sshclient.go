@@ -66,7 +66,7 @@ func showChoice(title, text string, buttons []string, done func(label string)) {
 		}
 		done(label)
 	})
-	uiPages.AddPage("ask", modal, true, true)
+	uiPages.AddPage("ask", modalLayer{modal}, true, true)
 	uiApp.SetFocus(modal)
 }
 

@@ -128,6 +128,8 @@ type nodeRow struct {
 	role   string
 	status string // Ready / NotReady / "" for saved hosts
 	custom bool
+
+	unreachable bool // didn't answer the activity panel's direct check
 }
 
 func clusterNodes() ([]nodeRow, error) {

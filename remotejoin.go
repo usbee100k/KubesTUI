@@ -57,15 +57,33 @@ func runRemoteHeadless(op string) int {
 	return 1
 }
 
-// centered wraps p in a fixed-size box in the middle of the screen.
+// centered wraps p in a fixed-size box in the middle of the screen. The
+// whole page is modal: clicks around the box never reach the screen behind.
 func centered(p tview.Primitive, width, height int) tview.Primitive {
-	return tview.NewFlex().
+	return modalLayer{tview.NewFlex().
 		AddItem(nil, 0, 1, false).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 			AddItem(nil, 0, 1, false).
 			AddItem(p, height, 1, true).
 			AddItem(nil, 0, 1, false), width, 1, true).
-		AddItem(nil, 0, 1, false)
+		AddItem(nil, 0, 1, false)}
+}
+
+// modalLayer wraps a dialog page so it swallows every mouse event the
+// dialog doesn't use. tview's Pages hands unused clicks to the page below,
+// so a click beside a button (or around the dialog) would otherwise press
+// whatever is behind it.
+type modalLayer struct{ tview.Primitive }
+
+func (m modalLayer) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (bool, tview.Primitive) {
+	inner := m.Primitive.MouseHandler()
+	return func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (bool, tview.Primitive) {
+		var capture tview.Primitive
+		if inner != nil {
+			_, capture = inner(action, event, setFocus)
+		}
+		return true, capture
+	}
 }
 
 func styleForm(form *tview.Form) {

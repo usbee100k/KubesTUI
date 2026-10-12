@@ -6,11 +6,14 @@ package main
 // node-status agent); on a workstation from the cluster API (activity_ws.go).
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rivo/tview"
@@ -23,7 +26,13 @@ const (
 	agentNodesFile  = "/var/lib/kubestui/nodes.json"
 	agentStaleAfter = 30 * time.Second
 
-	activityEvery   = 5 * time.Second
+	activityEvery = 3 * time.Second
+
+	// Kubernetes marks a node NotReady only after ~40s without word from
+	// it. Each poll also knocks on every node's kubelet port, so a node
+	// that lost power shows within a few seconds.
+	kubeletPort     = "10250"
+	probeTimeout    = time.Second
 	activityNewFor  = 2 * time.Minute
 	activityMaxRows = 10 // node lights shown before "+N more"
 )
@@ -76,6 +85,9 @@ func (a *activityPanel) Start() {
 	go func() {
 		for {
 			rows, err := source()
+			if err == nil {
+				probeNodes(rows)
+			}
 			select {
 			case <-stop:
 				return
@@ -137,7 +149,7 @@ func (a *activityPanel) update(rows []nodeRow, err error) {
 
 	ready := 0
 	for _, r := range rows {
-		if r.status == "Ready" {
+		if r.status == "Ready" && !r.unreachable {
 			ready++
 		}
 	}
@@ -156,7 +168,7 @@ func (a *activityPanel) update(rows []nodeRow, err error) {
 			break
 		}
 		dot := "[green]●[-]"
-		if r.status != "Ready" {
+		if r.status != "Ready" || r.unreachable {
 			dot = "[red]●[-]"
 		}
 		role := r.role
@@ -164,7 +176,10 @@ func (a *activityPanel) update(rows []nodeRow, err error) {
 			role = "worker"
 		}
 		line := fmt.Sprintf("  %s %s [gray]%-15s %s[-]", dot, pad(tview.Escape(r.name), 14), r.host, role)
-		if r.status != "Ready" {
+		switch {
+		case r.unreachable:
+			line += " [red]unreachable[-]"
+		case r.status != "Ready":
 			line += " [red]NotReady[-]"
 		}
 		if t := a.seen[r.name]; !t.IsZero() && now.Sub(t) < activityNewFor {
@@ -184,6 +199,39 @@ func (a *activityPanel) update(rows []nodeRow, err error) {
 func (a *activityPanel) resize(lines int) {
 	if a.onRefresh != nil {
 		a.onRefresh(lines)
+	}
+}
+
+// probeNodes marks nodes whose kubelet port doesn't answer within a second.
+// If none answers, this computer can't reach the node network at all (e.g. a
+// VPN that only routes the API), which says nothing about the nodes, so
+// none is marked.
+func probeNodes(rows []nodeRow) {
+	down := make([]bool, len(rows))
+	var wg sync.WaitGroup
+	for i := range rows {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			defer cancel()
+			c, err := vpnDial(ctx, "tcp", net.JoinHostPort(rows[i].host, kubeletPort))
+			if err != nil {
+				down[i] = true
+				return
+			}
+			c.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	for _, d := range down {
+		if !d {
+			for i := range rows {
+				rows[i].unreachable = down[i]
+			}
+			return
+		}
 	}
 }
 
