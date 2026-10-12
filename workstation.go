@@ -553,6 +553,7 @@ func (w *workstation) actions() []wsAction {
 		{title: "Import Docker Compose App", desc: "Deploy a docker-compose.yml from this computer into the cluster through GitOps", run: w.importCompose},
 		{title: "Remove Imported App", desc: "Remove an app imported from Docker Compose (and its data)", op: "compose-remove", confirm: true},
 		{title: "VPN", desc: w.vpnSummary(), run: func() { w.vpnScreen().Show() }},
+		{title: "Set Up Torrent VPN (PIA)", desc: "Private Internet Access login for qBittorrent (it only runs through the VPN)", op: "torrent-vpn", confirm: true},
 		{title: "Open Shell on Control Plane", desc: "A terminal on " + w.current.Host, run: w.openShell},
 		{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
 		{title: "Use kubectl from This Computer", desc: "kubeconfig location and commands for kubectl, k9s or Lens", run: w.showKubectl},

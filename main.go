@@ -139,6 +139,14 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Set Up Torrent VPN (PIA)",
+		Desc:  "Store your Private Internet Access login for qBittorrent. qBittorrent only runs through the PIA VPN (gluetun, with a kill switch); this asks for the login, restarts qBittorrent and shows the public IP and forwarded port it uses.",
+		Op:    "torrent-vpn",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run torrent-vpn",
+		},
+	},
+	{
 		Title: "Generate Join Commands",
 		Desc:  "Print fresh join commands for control plane and worker nodes.",
 		Op:    "join-commands",
@@ -2014,6 +2022,7 @@ func main() {
 		uiScreen = screen
 	}
 	uiApp = app
+	enableMouseLog(app)
 
 	// Not launched by homelabCD's install.sh: a workstation, unless this
 	// Linux machine is a cluster node, in which case ask (see mode.go).
