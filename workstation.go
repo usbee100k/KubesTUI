@@ -556,6 +556,7 @@ func (w *workstation) actions() []wsAction {
 		{title: "Set Up Torrent VPN (PIA)", desc: "Private Internet Access login for qBittorrent (it only runs through the VPN)", op: "torrent-vpn", confirm: true},
 		{title: "Open Shell on Control Plane", desc: "A terminal on " + w.current.Host, run: w.openShell},
 		{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
+		{title: "Open k9s", desc: "Browse pods, logs and events in k9s on this computer (downloads it the first time)", run: w.openK9s},
 		{title: "Use kubectl from This Computer", desc: "kubeconfig location and commands for kubectl, k9s or Lens", run: w.showKubectl},
 		{title: "Update homelabCD and KubesTUI", desc: "Pull the latest homelabCD and rebuild KubesTUI on " + w.current.Host + " (settings are kept)", op: "update", confirm: true},
 		{title: "Update GitOps Templates", desc: "Merge new homelabCD templates into your GitOps repo; your edits and settings are kept", op: "gitops-update", confirm: true},
