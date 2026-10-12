@@ -75,7 +75,10 @@ func (w *workstation) selfUpdate() {
 		`v=$(git -c safe.directory="$src" describe --tags --always --dirty 2>/dev/null || echo dev)`,
 		"mkdir -p " + remoteUpdateDir,
 		fmt.Sprintf(`echo "Building KubesTUI $v for %s/%s on $(hostname) (a minute or two)..."`, runtime.GOOS, runtime.GOARCH),
-		fmt.Sprintf(`CGO_ENABLED=0 GOOS=%s GOARCH=%s go build -trimpath -ldflags "-s -w -X main.version=$v" -o "%s.tmp" .`,
+		// The version comes from git describe above. Go's own VCS stamping
+		// runs git without safe.directory and fails (exit 128) when the
+		// sources belong to another user, e.g. root after an update.
+		fmt.Sprintf(`CGO_ENABLED=0 GOOS=%s GOARCH=%s go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=$v" -o "%s.tmp" .`,
 			runtime.GOOS, runtime.GOARCH, out),
 		fmt.Sprintf(`mv "%s.tmp" "%s"`, out, out),
 		fmt.Sprintf(`echo "$v" > "%s.version"`, out),
