@@ -1,8 +1,9 @@
 package main
 
-// Live activity lights for the node menu header: one light for the
-// cluster and one per node, refreshed from `kubectl get nodes` every few
-// seconds. Nodes that join while KubesTUI is open are marked NEW.
+// Live activity lights for the menu header: one light for the cluster and
+// one per node, refreshed every few seconds. Nodes that join while KubesTUI
+// is open are marked NEW. On a node the list comes from kubectl (or the
+// node-status agent); on a workstation from the cluster API (activity_ws.go).
 
 import (
 	"errors"
@@ -35,39 +36,77 @@ type activityPanel struct {
 	// lines the panel wants, so the header can grow with the node count.
 	onRefresh func(lines int)
 
+	source func() ([]nodeRow, error) // polled in the background
+	name   func() string             // cluster name, on the UI goroutine
+	hint   func(error) string        // explains a failed poll
+
 	seen   map[string]time.Time // when each node first appeared
 	polled bool                 // the first poll only records nodes, never as NEW
 	beat   bool
+	stop   chan struct{} // closes the running poll loop
 }
 
 func newActivityPanel(app *tview.Application) *activityPanel {
 	a := &activityPanel{
-		app:  app,
-		view: tview.NewTextView().SetDynamicColors(true).SetWrap(false), // narrow terminal: cut, not wrap
-		seen: map[string]time.Time{},
+		app:    app,
+		view:   tview.NewTextView().SetDynamicColors(true).SetWrap(false), // narrow terminal: cut, not wrap
+		seen:   map[string]time.Time{},
+		source: clusterNodes,
+		name: func() string {
+			if name := readClusterName(); name != "" && name != cluster.Name {
+				cluster.Name = name
+			}
+			return cluster.Name
+		},
+		hint: apiHint,
 	}
 	a.view.SetText("  [yellow::b]ACTIVITY[-::-]\n  [gray]● checking nodes…[-]")
 	return a
 }
 
-// Start polls in the background for the life of the program.
+// Start polls source in the background until Stop. Starting again (e.g. for
+// another cluster) replaces the previous loop and forgets its nodes.
 func (a *activityPanel) Start() {
+	a.Stop()
+	a.seen, a.polled = map[string]time.Time{}, false
+	a.view.SetText("  [yellow::b]ACTIVITY[-::-]\n  [gray]● checking nodes…[-]")
+
+	stop, source := make(chan struct{}), a.source
+	a.stop = stop
 	go func() {
 		for {
-			rows, err := clusterNodes()
-			a.app.QueueUpdateDraw(func() { a.update(rows, err) })
-			time.Sleep(activityEvery)
+			rows, err := source()
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			a.app.QueueUpdateDraw(func() {
+				if a.stop == stop { // not replaced meanwhile
+					a.update(rows, err)
+				}
+			})
+			select {
+			case <-stop:
+				return
+			case <-time.After(activityEvery):
+			}
 		}
 	}()
+}
+
+// Stop ends the poll loop, if any. Call it on the UI goroutine.
+func (a *activityPanel) Stop() {
+	if a.stop != nil {
+		close(a.stop)
+		a.stop = nil
+	}
 }
 
 func (a *activityPanel) update(rows []nodeRow, err error) {
 	now := time.Now()
 	a.beat = !a.beat
-
-	if name := readClusterName(); name != "" && name != cluster.Name {
-		cluster.Name = name
-	}
+	name := a.name()
 
 	for _, r := range rows {
 		if _, ok := a.seen[r.name]; !ok {
@@ -89,8 +128,8 @@ func (a *activityPanel) update(rows []nodeRow, err error) {
 	fmt.Fprintf(&b, "  [yellow::b]ACTIVITY[-::-]   %s [gray]live · %s[-]\n", pulse, now.Format("15:04:05"))
 
 	if err != nil {
-		b.WriteString("  [red]●[-] [::b]" + pad(strings.ToUpper(tview.Escape(cluster.Name)), 14) + "[::-] [red]API unreachable[-]\n")
-		b.WriteString("  [gray]  " + tview.Escape(apiHint(err)) + "[-]\n")
+		b.WriteString("  [red]●[-] [::b]" + pad(strings.ToUpper(tview.Escape(name)), 14) + "[::-] [red]API unreachable[-]\n")
+		b.WriteString("  [gray]  " + tview.Escape(a.hint(err)) + "[-]\n")
 		a.view.SetText(b.String())
 		a.resize(3)
 		return
@@ -109,7 +148,7 @@ func (a *activityPanel) update(rows []nodeRow, err error) {
 	case ready < len(rows):
 		light = "[yellow]●[-]"
 	}
-	fmt.Fprintf(&b, "  %s [::b]%s[::-] %d/%d nodes Ready\n", light, pad(strings.ToUpper(tview.Escape(cluster.Name)), 14), ready, len(rows))
+	fmt.Fprintf(&b, "  %s [::b]%s[::-] %d/%d nodes Ready\n", light, pad(strings.ToUpper(tview.Escape(name)), 14), ready, len(rows))
 
 	for i, r := range rows {
 		if i == activityMaxRows {

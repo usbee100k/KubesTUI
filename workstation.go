@@ -57,6 +57,9 @@ type workstation struct {
 	reachChecked map[string]bool // clusters already checked this session
 
 	pendingNote string // shown on the cluster page when it next opens
+
+	activity    *activityPanel // live node lights on the cluster page
+	activityFor *clusterProfile
 }
 
 // demoActive is true while the demo cluster is open (see demo.go).
@@ -212,6 +215,8 @@ func (w *workstation) buildHome() {
 
 func (w *workstation) showHome() {
 	demoActive = false
+	w.activity.Stop()
+	w.activityFor = nil
 	w.profiles = listProfiles()
 	t := w.homeTable
 	t.Clear()
@@ -519,8 +524,10 @@ type wsAction struct {
 }
 
 func (w *workstation) buildCluster() {
-	w.clusterInfo = tview.NewTextView().SetDynamicColors(true)
+	w.clusterInfo = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 	w.clusterNote = tview.NewTextView().SetDynamicColors(true)
+	w.activity = newActivityPanel(w.app)
+	w.activity.hint = workstationHint
 
 	w.clusterList = tview.NewList().
 		ShowSecondaryText(true).
@@ -532,9 +539,10 @@ func (w *workstation) buildCluster() {
 
 	header := tview.NewTextView().SetDynamicColors(true).SetText("\n  [yellow::b]OPERATIONS[-::-]")
 
-	body := frame("HOMELAB KUBERNETES PLATFORM")
+	body := &clusterBody{Flex: frame("HOMELAB KUBERNETES PLATFORM"), top: tview.NewFlex(),
+		info: w.clusterInfo, lights: w.activity.view, lines: 2}
 	body.AddItem(nil, 1, 0, false).
-		AddItem(w.clusterInfo, 7, 0, false).
+		AddItem(body.top, 7, 0, false).
 		AddItem(header, 2, 0, false).
 		AddItem(w.clusterList, 0, 1, true).
 		AddItem(w.clusterNote, 2, 0, false)
@@ -542,6 +550,48 @@ func (w *workstation) buildCluster() {
 	w.cluster = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(body, 0, 1, true).
 		AddItem(w.footer, 1, 0, false)
+
+	w.activity.onRefresh = func(lines int) { body.lines = lines }
+}
+
+// clusterBody is the cluster page's frame. Its header shows the live node
+// lights beside the cluster info (as on a node) when the terminal is wide
+// enough, and under it when it isn't, sized to the node count either way.
+type clusterBody struct {
+	*tview.Flex
+	top          *tview.Flex
+	info, lights tview.Primitive
+	lines        int // rows the lights want (activityPanel.onRefresh)
+	layout       int // 0 not built yet, 1 side by side, 2 stacked
+}
+
+const (
+	clusterInfoRows = 6  // CLUSTER … MODE
+	lightsWidth     = 58 // a node line with role and a NotReady/NEW tag
+	sideBySideMin   = 104
+)
+
+func (c *clusterBody) Draw(screen tcell.Screen) {
+	_, _, width, _ := c.GetInnerRect()
+	layout, height := 1, max(clusterInfoRows+1, c.lines)
+	if width < sideBySideMin {
+		layout, height = 2, clusterInfoRows+1+c.lines
+	}
+	if layout != c.layout {
+		c.layout = layout
+		c.top.Clear()
+		if layout == 1 {
+			c.top.SetDirection(tview.FlexColumn).
+				AddItem(c.info, 0, 1, false).
+				AddItem(c.lights, lightsWidth, 0, false)
+		} else {
+			c.top.SetDirection(tview.FlexRow).
+				AddItem(c.info, clusterInfoRows+1, 0, false).
+				AddItem(c.lights, 0, 1, false)
+		}
+	}
+	c.ResizeItem(c.top, height, 0)
+	c.Flex.Draw(screen)
 }
 
 func (w *workstation) actions() []wsAction {
@@ -606,6 +656,15 @@ func (w *workstation) showCluster() {
 	}
 	w.clusterNote.SetText(w.pendingNote)
 	w.pendingNote = ""
+
+	// Poll this cluster's nodes; coming back from a terminal or dialog
+	// keeps the running loop (and its NEW markers).
+	if w.activityFor != p {
+		w.activityFor = p
+		w.activity.source = workstationNodeSource(p)
+		w.activity.name = func() string { return p.Name }
+		w.activity.Start()
+	}
 
 	w.pages.AddAndSwitchToPage("cluster", w.cluster, true)
 	w.footer.SetText(" [aqua::b]UP/DOWN[-::-] Navigate    [aqua::b]ENTER[-::-] Select    [aqua::b]ESC[-::-] Clusters    [aqua::b]Q[-::-] Quit")
