@@ -2078,6 +2078,8 @@ func main() {
 		app.SetFocus(detail)
 	}
 
+	var openCC func()
+	list.AddItem("  Command Center", "", 0, func() { openCC() })
 	for _, op := range operations {
 		op := op
 		list.AddItem("  "+op.Title, "", 0, func() { showDetail(op) })
@@ -2133,6 +2135,15 @@ func main() {
 		app.SetFocus(list)
 	}
 
+	ccPage = newCommandCenter(app, pages, footer)
+	ccPage.actionsBlocked = func() string {
+		if dryRun {
+			return "SAFE-DRY-RUN: switch to LIVE in the menu to restart pods or cordon nodes."
+		}
+		return ""
+	}
+	openCC = func() { ccPage.Open(nodeCCSource(), cluster.Name, backToMain) }
+
 	tuiRunner = newRunner(app, pages, footer, backToDetail)
 	termPage = newTermScreen(app, pages, footer)
 	sshPage = newSSHConsole(app, pages, footer, backToMain)
@@ -2156,6 +2167,10 @@ func main() {
 			return sshPage.HandleKey(ev)
 		case "share":
 			return sharer.HandleKey(ev)
+		case "cc":
+			return ccPage.HandleKey(ev)
+		case "cclogs":
+			return ccPage.logs.HandleKey(ev)
 		case "sshform", "rjform", "ask":
 			return ev // the form handles its own keys; ESC cancels it
 		}

@@ -88,6 +88,7 @@ func setupWorkstation(app *tview.Application) *workstation {
 	uiPages = w.pages
 
 	termPage = newTermScreen(app, w.pages, w.footer)
+	ccPage = newCommandCenter(app, w.pages, w.footer)
 	sshPage = newSSHConsole(app, w.pages, w.footer, w.showCluster)
 	sshPage.nodesFn = func() ([]nodeRow, error) { return w.nodeCache, w.nodeErr }
 	sshPage.connectFn = w.connectNode
@@ -122,6 +123,10 @@ func (w *workstation) capture(ev *tcell.EventKey) *tcell.EventKey {
 		return sshPage.HandleKey(ev)
 	case "vpn":
 		return w.vpnScreen().HandleKey(ev)
+	case "cc":
+		return ccPage.HandleKey(ev)
+	case "cclogs":
+		return ccPage.logs.HandleKey(ev)
 	case "ask", "pair", "sshform", "rjform", "vpnimport", "composeform":
 		return ev
 	case "pairlog":
@@ -596,6 +601,7 @@ func (c *clusterBody) Draw(screen tcell.Screen) {
 
 func (w *workstation) actions() []wsAction {
 	return []wsAction{
+		{title: "Command Center", desc: "Live view of everything: nodes, IPs, CPU/memory/disk/network, pods, namespaces, Argo CD apps, LAN IPs, storage and alerts", run: w.openCommandCenter},
 		{title: "Cluster Health Check", desc: "Nodes, control plane, networking, DNS, Argo CD, storage, certificates", op: "health"},
 		{title: "Cluster Configuration", desc: "config/cluster.yaml and the live kubeadm configuration", op: "config"},
 		{title: "Generate Join Commands", desc: "Fresh join commands for new nodes", op: "join-commands"},
@@ -732,6 +738,17 @@ func (w *workstation) runAction(a wsAction) {
 				launch()
 			}
 		})
+}
+
+// openCommandCenter shows the live Command Center for the current cluster.
+func (w *workstation) openCommandCenter() {
+	p := w.current
+	src, err := workstationCCSource(p)
+	if err != nil {
+		w.clusterNote.SetText("  [yellow]" + tview.Escape(err.Error()) + "[-]")
+		return
+	}
+	ccPage.Open(src, p.Name, w.showCluster)
 }
 
 func (w *workstation) openShell() {
