@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -232,6 +233,8 @@ func demoScriptFor(op string) func(d *demoTerm) int {
 		return demoLonghornDisk
 	case "vpn-status":
 		return demoVPNStatus
+	case "os-update":
+		return demoOSUpdate
 	}
 	return func(d *demoTerm) int {
 		d.Print("demo: no simulation for " + op + "\n")
@@ -464,6 +467,245 @@ func demoRepair(d *demoTerm) int {
 	}
 	d.Print(demoNodesTable(true))
 	d.Print(cGreen + "[ OK ]" + cReset + " Repair completed.\n")
+	return 0
+}
+
+// demoOSUpdate mirrors homelabCD's update_node_os (lib/os-update.sh).
+func demoOSUpdate(d *demoTerm) int {
+	if !demoSudo(d) {
+		return d.exitCode()
+	}
+	d.Print("\nNodes:\n")
+	for i, n := range demoNodes {
+		d.Printf("  %2d) %-16s %-14s %-9s %s\n", i+1, n.name, n.role, n.status, "Ubuntu 24.04.3 LTS")
+	}
+	d.Print("\nRuns: apt update, then apt upgrade -y, on one node at a time.\n" +
+		"Kubernetes packages (kubelet, kubeadm, kubectl) stay on their version.\n" +
+		"Nodes are not rebooted; the ones that need it are listed at the end.\n\n" +
+		"Nodes to update: a = all, or numbers like \"1 3\" (blank = cancel): ")
+
+	answer, ok := d.ReadLine(true)
+	if !ok {
+		return d.exitCode()
+	}
+	answer = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(answer, ",", " ")))
+	if answer == "" {
+		d.Print(cGreen + "[ OK ]" + cReset + " Cancelled; nothing changed.\n")
+		return 0
+	}
+
+	var picked []int
+	if answer == "a" || answer == "all" {
+		for i := range demoNodes {
+			picked = append(picked, i)
+		}
+	} else {
+		seen := map[int]bool{}
+		for _, f := range strings.Fields(answer) {
+			n, err := strconv.Atoi(f)
+			if err != nil || n < 1 || n > len(demoNodes) {
+				d.Printf(cRed+"[FAIL]"+cReset+" \"%s\" isn't a node number (1-%d).\n", f, len(demoNodes))
+				return 1
+			}
+			if !seen[n-1] {
+				seen[n-1] = true
+				picked = append(picked, n-1)
+			}
+		}
+	}
+
+	var updated, skipped, reboot []string
+	for k, i := range picked {
+		n := demoNodes[i]
+		d.Print("\n============================================================\n " +
+			n.name + "  (" + n.role + ")\n============================================================\n")
+		if n.status != "Ready" {
+			d.Print(cYellow + "[WARN]" + cReset + " " + n.name + " is NotReady; skipping it.\n")
+			skipped = append(skipped, n.name+" (NotReady, skipped)")
+			continue
+		}
+		upgrades := []string{"libssl3t64", "openssl", "linux-firmware", "python3-urllib3", "containerd.io"}
+		count := 3 + k%3 // a different list on each node
+		lines := []string{
+			">>> apt update",
+			"Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease",
+			"Get:2 http://archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]",
+			"Get:3 http://security.ubuntu.com/ubuntu noble-security InRelease [126 kB]",
+			"Hit:4 https://pkgs.k8s.io/core:/stable:/v1.36/deb  InRelease",
+			"Fetched 1,284 kB in 2s (642 kB/s)",
+			"Reading package lists... Done",
+			"",
+			">>> apt upgrade -y",
+			"Reading package lists... Done",
+			"Building dependency tree... Done",
+			"Calculating upgrade... Done",
+			"The following packages have been kept back:",
+			"  kubeadm kubectl kubelet",
+			"The following packages will be upgraded:",
+			"  " + strings.Join(upgrades[:count], " "),
+			fmt.Sprintf("%d upgraded, 0 newly installed, 0 to remove and 3 not upgraded.", count),
+		}
+		for _, p := range upgrades[:count] {
+			lines = append(lines, "Unpacking "+p+" ...", "Setting up "+p+" ...")
+		}
+		lines = append(lines, "")
+		needReboot := n.role == "control-plane" && k%2 == 0
+		if needReboot {
+			lines = append(lines, "HOMELABCD: REBOOT REQUIRED")
+		}
+		if !d.Lines(120*time.Millisecond, lines...) {
+			return d.exitCode()
+		}
+		d.Print(cGreen + "[ OK ]" + cReset + " " + n.name + ": operating system updated.\n")
+		updated = append(updated, n.name)
+		if needReboot {
+			reboot = append(reboot, n.name)
+		}
+	}
+
+	d.Print("\n============================================================\n Summary\n============================================================\n")
+	if len(updated) > 0 {
+		d.Print("  Updated      : " + strings.Join(updated, " ") + "\n")
+	}
+	if len(skipped) > 0 {
+		d.Print("  Failed       : " + strings.Join(skipped, " ") + "\n")
+	}
+	if len(reboot) > 0 {
+		d.Print("  Needs reboot : " + strings.Join(reboot, " ") + "\n")
+	} else {
+		d.Print("  Needs reboot : none\n")
+	}
+	d.Print("\n")
+	code := 0
+	if len(skipped) > 0 {
+		code = 1
+	}
+	if c := demoRebootMenu(d, reboot); c != 0 {
+		code = c
+	}
+	return code
+}
+
+// demoRebootMenu mirrors reboot_nodes_menu in homelabCD's lib/os-update.sh.
+// The demo runs on cp1, so cp1 goes last and is not drained.
+func demoRebootMenu(d *demoTerm, need []string) int {
+	has := func(list []string, n string) bool {
+		for _, x := range list {
+			if x == n {
+				return true
+			}
+		}
+		return false
+	}
+	d.Print("Reboot nodes now?\n")
+	for i, n := range demoNodes {
+		line := fmt.Sprintf("  %2d) %-16s", i+1, n.name)
+		if has(need, n.name) {
+			line += " needs reboot"
+		}
+		if n.name == "cp1" {
+			line += " (this node: rebooted last, ends this session)"
+		}
+		d.Print(line + "\n")
+	}
+	d.Print("\n")
+	if len(need) > 0 {
+		d.Print("  r = the ones that need it (" + strings.Join(need, " ") + ")\n")
+	}
+	d.Print("  a = all, numbers like \"1 3\", blank = not now (reboot them yourself later)\nReboot: ")
+
+	answer, ok := d.ReadLine(true)
+	if !ok {
+		return d.exitCode()
+	}
+	answer = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(answer, ",", " ")))
+
+	var picked []string
+	switch answer {
+	case "":
+		if len(need) > 0 {
+			d.Print("\nNot rebooting. To do it yourself later, one node at a time:\n" +
+				"  kubectl drain <node> --ignore-daemonsets --delete-emptydir-data\n" +
+				"  sudo reboot                      (on that node)\n" +
+				"  kubectl uncordon <node>          (once it is Ready again)\n")
+		}
+		return 0
+	case "r":
+		picked = need
+	case "a", "all":
+		for _, n := range demoNodes {
+			picked = append(picked, n.name)
+		}
+	default:
+		for _, f := range strings.Fields(answer) {
+			i, err := strconv.Atoi(f)
+			if err != nil || i < 1 || i > len(demoNodes) {
+				d.Printf(cRed+"[FAIL]"+cReset+" \"%s\" isn't a node number (1-%d). Nothing was rebooted.\n", f, len(demoNodes))
+				return 1
+			}
+			if !has(picked, demoNodes[i-1].name) {
+				picked = append(picked, demoNodes[i-1].name)
+			}
+		}
+	}
+	if len(picked) == 0 {
+		d.Print(cGreen + "[ OK ]" + cReset + " No nodes need a reboot.\n")
+		return 0
+	}
+
+	var ordered []string
+	for _, n := range picked {
+		if n != "cp1" {
+			ordered = append(ordered, n)
+		}
+	}
+	if has(picked, "cp1") {
+		ordered = append(ordered, "cp1")
+	}
+
+	info := cBlue + "[INFO]" + cReset + " "
+	for _, name := range ordered {
+		d.Print("\n============================================================\n Rebooting " + name +
+			"\n============================================================\n")
+		var node nodeRow
+		for _, n := range demoNodes {
+			if n.name == name {
+				node = n
+			}
+		}
+		if name == "cp1" {
+			d.Print(cYellow + "[WARN]" + cReset + " cp1 is the node running this; it reboots now and this session ends.\n" +
+				cYellow + "[WARN]" + cReset + " When it is back, check: kubectl get nodes\n")
+			if !d.Sleep(1500 * time.Millisecond) {
+				return d.exitCode()
+			}
+			d.Print("\nConnection to 10.99.0.11 closed by remote host.\n")
+			return 0
+		}
+		if !d.Lines(300*time.Millisecond,
+			info+"Moving pods off "+name+" (drain)...",
+			"node/"+name+" cordoned",
+			"Warning: ignoring DaemonSet-managed Pods: kube-system/cilium-x9f2k, kube-system/kube-proxy-7hd4q, longhorn-system/longhorn-manager-2kq8v",
+			"evicting pod default/demo-app-6d9f7c8b5-qx2lp",
+			"pod/demo-app-6d9f7c8b5-qx2lp evicted",
+			"node/"+name+" drained",
+		) {
+			return d.exitCode()
+		}
+		if node.status != "Ready" {
+			d.Print(cRed + "[FAIL]" + cReset + " " + name + " did not come back Ready within 15 minutes.\n" +
+				"  Check it, then run: kubectl uncordon " + name + "\n" +
+				cRed + "[FAIL]" + cReset + " Stopped: fix " + name + " before rebooting more nodes.\n")
+			return 1
+		}
+		if !d.Lines(900*time.Millisecond,
+			info+"Waiting for "+name+" to restart and be Ready (up to 15 minutes)...",
+			info+"Still waiting for "+name+" (60s)...",
+		) {
+			return d.exitCode()
+		}
+		d.Print(cGreen + "[ OK ]" + cReset + " " + name + " rebooted and is Ready.\n")
+	}
 	return 0
 }
 

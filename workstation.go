@@ -616,7 +616,7 @@ func (w *workstation) actions() []wsAction {
 		{title: "Open Shell on Control Plane", desc: "A terminal on " + w.current.Host, run: w.openShell},
 		{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
 		{title: "Open k9s", desc: "Browse pods, logs and events in k9s on this computer (downloads it the first time)", run: w.openK9s},
-		{title: "Use kubectl from This Computer", desc: "kubeconfig location and commands for kubectl, k9s or Lens", run: w.showKubectl},
+		{title: "Update Operating System", desc: "apt update and apt upgrade -y on all nodes or the ones you pick, one at a time; lists nodes that need a reboot", op: "os-update", confirm: true},
 		{title: "Update homelabCD and KubesTUI", desc: "Pull the latest homelabCD and rebuild KubesTUI on " + w.current.Host + " (settings are kept)", op: "update", confirm: true},
 		{title: "Update GitOps Templates", desc: "Merge new homelabCD templates into your GitOps repo; your edits and settings are kept", op: "gitops-update", confirm: true},
 		{title: "Update KubesTUI on This Computer", desc: "Build the newest KubesTUI on " + w.current.Host + " and install it here (" + version + " now)", run: w.selfUpdate},

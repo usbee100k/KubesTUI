@@ -181,6 +181,14 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Update Operating System",
+		Desc:  "Run apt update and apt upgrade -y on all nodes or the ones you pick, one node at a time, through Kubernetes (no SSH needed). Kubernetes packages stay on their version and nothing is rebooted; nodes that need a reboot are listed at the end.",
+		Op:    "os-update",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run os-update",
+		},
+	},
+	{
 		Title: "Update homelabCD and KubesTUI",
 		Desc:  "Pull the latest homelabCD from GitHub (your saved settings in config/ are kept) and rebuild KubesTUI. Doesn't change the cluster. Reopen KubesTUI (kbtui) afterwards to use the new version.",
 		Op:    "update",
