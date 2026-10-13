@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -91,6 +92,9 @@ func writeApp(root string, plan *importPlan) error {
 
 	var files []string
 	write := func(name string, docs ...obj) error {
+		if slices.Contains(files, name) {
+			return fmt.Errorf("two resources would be written to %s; nothing was deployed", name)
+		}
 		files = append(files, name)
 		return writeYAML(filepath.Join(res, name), docs...)
 	}
@@ -301,7 +305,11 @@ func writeApp(root string, plan *importPlan) error {
 				vols = append(vols, obj{"name": name, "configMap": obj{"name": v.cmName}})
 				m["subPath"] = v.cmKey
 			case "hostpath":
-				vols = append(vols, obj{"name": name, "hostPath": obj{"path": v.hostPath}})
+				hp := obj{"path": v.hostPath}
+				if v.hostType != "" {
+					hp["type"] = v.hostType
+				}
+				vols = append(vols, obj{"name": name, "hostPath": hp})
 				if v.node != "" {
 					nodePin = v.node
 				}

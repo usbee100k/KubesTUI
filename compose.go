@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,6 +70,17 @@ func (p *prompter) choose(question string, options []string, def string) string 
 			}
 		}
 		fmt.Println("  [ERROR] Choose one of: " + strings.Join(options, ", "))
+	}
+}
+
+// size asks for a volume size until it gets one (5Gi, 500Mi, 1Ti, 10).
+func (p *prompter) size(question, def string) string {
+	for {
+		a := strings.TrimSpace(p.ask(question, def))
+		if sizePattern.MatchString(a) {
+			return normSize(a)
+		}
+		fmt.Println("    [ERROR] Enter a size like 5Gi, 500Mi or 1Ti.")
 	}
 }
 
@@ -200,6 +212,78 @@ func usedLBIPs(gitopsDir string) map[string]bool {
 	return used
 }
 
+// nodeNames lists the cluster's node names (nil if it can't be asked).
+func nodeNames() []string {
+	rows, err := clusterNodes()
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, r := range rows {
+		names = append(names, strings.ToLower(r.name))
+	}
+	return names
+}
+
+var ingressHostPattern = regexp.MustCompile(`(?m)^\s*-?\s*host:\s*"?([a-z0-9][a-z0-9.-]*\.[a-z0-9.-]+)`)
+
+// usedHosts collects ingress hostnames other apps already use: in the
+// cluster and in the GitOps repo. The app being (re)imported doesn't count.
+func usedHosts(gitopsDir, app string) map[string]string {
+	used := map[string]string{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "kubectl", "get", "ingress", "-A", "-o",
+		`jsonpath={range .items[*]}{.metadata.namespace}{" "}{.spec.rules[*].host}{"\n"}{end}`).Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.Fields(line)
+			if len(f) < 2 || f[0] == app {
+				continue
+			}
+			for _, h := range f[1:] {
+				used[strings.ToLower(h)] = f[0]
+			}
+		}
+	}
+	own := filepath.Join(gitopsDir, appsDirRel, app) + string(filepath.Separator)
+	_ = filepath.Walk(filepath.Join(gitopsDir, "apps"), func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".yaml") || strings.HasPrefix(path, own) {
+			return nil
+		}
+		if data, err := os.ReadFile(path); err == nil {
+			for _, m := range ingressHostPattern.FindAllSubmatch(data, -1) {
+				if _, ok := used[string(m[1])]; !ok {
+					rel, _ := filepath.Rel(gitopsDir, path)
+					used[string(m[1])] = rel
+				}
+			}
+		}
+		return nil
+	})
+	return used
+}
+
+var hostnamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// webPortFor picks the port that gets the web UI by default: the first
+// well-known web port, else the first published TCP port that isn't a
+// database or a low system port. 0 if none.
+func webPortFor(s types.ServiceConfig) uint32 {
+	var fallback uint32
+	for _, pc := range s.Ports {
+		if pc.Published == "" || strings.EqualFold(pc.Protocol, "udp") || knownInternalPort(pc.Target) {
+			continue
+		}
+		if knownWebPort(pc.Target) {
+			return pc.Target
+		}
+		if fallback == 0 && (pc.Target >= 1024 || pc.Target == 80 || pc.Target == 443) {
+			fallback = pc.Target
+		}
+	}
+	return fallback
+}
+
 // ---------------------------------------------------------------------------
 // The plan: what gets generated
 // ---------------------------------------------------------------------------
@@ -223,6 +307,7 @@ type volumePlan struct {
 	cmName   string
 	cmKey    string
 	hostPath string
+	hostType string // hostpath: Directory / CharDevice ("" = no check)
 	node     string // hostpath: pin to node
 	medium   string // emptydir
 	limit    string // emptydir
@@ -453,14 +538,16 @@ func runComposeImport() int {
 	}
 
 	composeDir := filepath.Dir(must(filepath.Abs(file)))
-	webCount := 0
+	webCount := 0 // services with a web UI: each gets its own hostname
 	for _, n := range names {
-		for _, pc := range proj.Services[n].Ports {
-			if pc.Published != "" && strings.ToLower(pc.Protocol) != "udp" && !knownInternalPort(pc.Target) {
-				webCount++
-			}
+		if webPortFor(proj.Services[n]) != 0 {
+			webCount++
 		}
 	}
+
+	hostsTaken := usedHosts(root, app) // hostname -> who uses it
+	nodes := nodeNames()
+	lanTaken := map[string]bool{} // "ip port/proto" used by this import
 
 	for _, n := range names {
 		s := proj.Services[n]
@@ -477,7 +564,10 @@ func runComposeImport() int {
 			sp.warnings = append(sp.warnings, "has build: settings; the image "+s.Image+" is used as-is")
 		}
 
-		// Ports.
+		// Ports. One web UI (hostname) per service by default; the other
+		// published ports default to the LAN, which is how Docker had them.
+		webPort := webPortFor(s)
+		lanIP := "" // this service's LAN IP; its LAN ports share it
 		for _, pc := range s.Ports {
 			pp := &portPlan{target: pc.Target, published: pc.Published, protocol: strings.ToUpper(pc.Protocol)}
 			if pp.protocol == "" {
@@ -488,14 +578,12 @@ func runComposeImport() int {
 				sp.ports = append(sp.ports, pp)
 				continue
 			}
-			def := "web"
+			def := "lan"
 			switch {
-			case pp.protocol == "UDP":
-				def = "lan"
 			case knownInternalPort(pc.Target):
 				def = "internal"
-			case !knownWebPort(pc.Target) && pc.Target < 1024 && pc.Target != 80 && pc.Target != 443:
-				def = "lan"
+			case pc.Target == webPort && pp.protocol != "UDP":
+				def = "web"
 			}
 			label := fmt.Sprintf("  Port %s->%d/%s:  web UI (https://…), lan (own IP), or internal", pc.Published, pc.Target, strings.ToLower(pp.protocol))
 			fmt.Println(label)
@@ -513,14 +601,34 @@ func runComposeImport() int {
 						host = app
 					}
 				}
-				suggest := host + "." + domain
+				suffix := "." + domain
 				if domain == "" {
-					suggest = host + ".home.arpa"
+					suffix = ".home.arpa"
 				}
-				pp.host = strings.ToLower(in.ask("    hostname", suggest))
-				pp.https = pc.Target == 443 || pc.Target == 8443
+				suggest := host + suffix
+				if _, taken := hostsTaken[suggest]; taken {
+					suggest = fmt.Sprintf("%s-%d%s", host, pc.Target, suffix)
+				}
+				for {
+					h := strings.ToLower(strings.TrimSuffix(in.ask("    hostname", suggest), "."))
+					if !hostnamePattern.MatchString(h) {
+						fmt.Println("    [ERROR] Not a hostname (like " + host + suffix + ").")
+						continue
+					}
+					if by, taken := hostsTaken[h]; taken {
+						fmt.Println("    [ERROR] " + h + " is already used by " + by + ". Choose another hostname.")
+						continue
+					}
+					pp.host = h
+					hostsTaken[h] = fmt.Sprintf("%s port %d", n, pc.Target)
+					break
+				}
+				pp.https = pc.Target == 443 || pc.Target == 8443 || pc.Target == 8920
 			case "lan":
-				suggest := nextFree()
+				suggest := lanIP
+				if suggest == "" {
+					suggest = nextFree()
+				}
 				for {
 					ip := in.ask("    LAN IP (from the MetalLB pool "+os.Getenv("METALLB_RANGE")+")", suggest)
 					a, err := netip.ParseAddr(ip)
@@ -530,16 +638,23 @@ func runComposeImport() int {
 							inPool = true
 						}
 					}
+					key := fmt.Sprintf("%s %s/%s", ip, pp.published, pp.protocol)
 					switch {
 					case err != nil:
 						fmt.Println("    [ERROR] Not an IP address.")
 					case len(pool) > 0 && !inPool:
 						fmt.Println("    [ERROR] Must be inside the MetalLB pool.")
-					case used[ip] && ip != suggest:
+					case used[ip] && ip != lanIP:
 						fmt.Println("    [ERROR] Already in use.")
+					case lanTaken[key]:
+						fmt.Println("    [ERROR] Port " + pp.published + "/" + strings.ToLower(pp.protocol) + " is already used on " + ip + ".")
 					default:
 						pp.ip = ip
 						used[ip] = true
+						lanTaken[key] = true
+						if lanIP == "" {
+							lanIP = ip
+						}
 					}
 					if pp.ip != "" {
 						break
@@ -554,7 +669,9 @@ func runComposeImport() int {
 			}
 		}
 
-		// Volumes.
+		// Volumes. A pod runs on one node, so all of a service's host
+		// folders must be on the same node.
+		hostNode := ""
 		for _, v := range s.Volumes {
 			vp := &volumePlan{target: v.Target, readOnly: v.ReadOnly}
 			switch v.Type {
@@ -567,8 +684,8 @@ func runComposeImport() int {
 					vp.kind, vp.claim = "pvc", pv.name
 					break
 				}
-				size := in.ask(fmt.Sprintf("  Volume %s -> %s: size", orDefault(v.Source, "(anonymous)"), v.Target), "5Gi")
-				plan.pvcs[claim] = &pvcPlan{name: claim, size: normSize(size), shared: volUsers[v.Source] > 1}
+				size := in.size(fmt.Sprintf("  Volume %s -> %s: size", orDefault(v.Source, "(anonymous)"), v.Target), "5Gi")
+				plan.pvcs[claim] = &pvcPlan{name: claim, size: size, shared: volUsers[v.Source] > 1}
 				vp.kind, vp.claim = "pvc", claim
 			case types.VolumeTypeBind:
 				src := v.Source
@@ -589,9 +706,9 @@ func runComposeImport() int {
 					vp.kind, vp.cmName, vp.cmKey = "configmap", cm, key
 					fmt.Printf("  File %s -> %s: stored in the app (ConfigMap)\n", src, v.Target)
 				case isRelativeSource(src):
-					claim := dnsName(sp.name + "-" + filepath.Base(src))
-					size := in.ask(fmt.Sprintf("  Folder %s -> %s: Longhorn volume size", src, v.Target), "5Gi")
-					plan.pvcs[claim] = &pvcPlan{name: claim, size: normSize(size)}
+					claim := uniqueClaim(plan, dnsName(sp.name+"-"+filepath.Base(src)))
+					size := in.size(fmt.Sprintf("  Folder %s -> %s: Longhorn volume size", src, v.Target), "5Gi")
+					plan.pvcs[claim] = &pvcPlan{name: claim, size: size}
 					vp.kind, vp.claim = "pvc", claim
 					sp.warnings = append(sp.warnings, fmt.Sprintf("%s starts empty: copy your Docker data from %s if you need it", v.Target, src))
 				case strings.HasPrefix(src, "/dev/"):
@@ -601,11 +718,12 @@ func runComposeImport() int {
 					choice := in.choose("    longhorn (new empty volume) or host (use that folder on one node)", []string{"longhorn", "host"}, "longhorn")
 					if choice == "host" {
 						vp.kind, vp.hostPath = "hostpath", src
-						vp.node = in.ask("    node that has "+src, nodeHostname())
+						vp.node = askNode(in, src, nodes, hostNode)
+						hostNode = vp.node
 					} else {
-						claim := dnsName(sp.name + "-" + filepath.Base(src))
-						size := in.ask("    size", "5Gi")
-						plan.pvcs[claim] = &pvcPlan{name: claim, size: normSize(size)}
+						claim := uniqueClaim(plan, dnsName(sp.name+"-"+filepath.Base(src)))
+						size := in.size("    size", "5Gi")
+						plan.pvcs[claim] = &pvcPlan{name: claim, size: size}
 						vp.kind, vp.claim = "pvc", claim
 						sp.warnings = append(sp.warnings, fmt.Sprintf("%s starts empty (was %s on the Docker host)", v.Target, src))
 					}
@@ -683,11 +801,31 @@ func runComposeImport() int {
 		if s.Restart == "no" {
 			sp.warnings = append(sp.warnings, `restart: "no" ignored; Kubernetes always restarts it`)
 		}
+		// Devices. Compose templates often list hardware that only some
+		// machines have (e.g. Raspberry Pi /dev/vchiq). A missing device
+		// would keep the pod from starting, so each one is a choice, and
+		// the default is whether this node has it.
 		for _, d := range s.Devices {
 			if !strings.HasPrefix(d.Source, "/dev/") {
 				continue
 			}
-			sp.volumes = append(sp.volumes, &volumePlan{target: orDefault(d.Target, d.Source), kind: "hostpath", hostPath: d.Source})
+			vp := &volumePlan{target: orDefault(d.Target, d.Source), kind: "hostpath", hostPath: d.Source}
+			here := ""
+			st, err := os.Stat(d.Source)
+			if err == nil {
+				if st.IsDir() {
+					vp.hostType = "Directory"
+				} else if st.Mode()&os.ModeCharDevice != 0 {
+					vp.hostType = "CharDevice"
+				}
+			} else {
+				here = " (not on " + nodeHostname() + ")"
+			}
+			if !in.yes(fmt.Sprintf("  Device %s%s: pass it through", d.Source, here), err == nil) {
+				sp.warnings = append(sp.warnings, "device "+d.Source+" not passed through")
+				continue
+			}
+			sp.volumes = append(sp.volumes, vp)
 		}
 	}
 
@@ -762,6 +900,41 @@ func ifNode(n string) string {
 		return ""
 	}
 	return " on " + n
+}
+
+// askNode asks which node has a host folder. It must be a cluster node, and
+// the same node as the service's other host folders (pinned, if any).
+func askNode(in *prompter, src string, nodes []string, pinned string) string {
+	def := pinned
+	if def == "" {
+		def = nodeHostname()
+		if len(nodes) > 0 && !slices.Contains(nodes, def) {
+			def = nodes[0]
+		}
+	}
+	for {
+		n := strings.ToLower(in.ask("    node that has "+src, def))
+		switch {
+		case len(nodes) > 0 && !slices.Contains(nodes, n):
+			fmt.Println("    [ERROR] " + n + " isn't a node in this cluster. Nodes: " + strings.Join(nodes, ", "))
+		case pinned != "" && n != pinned:
+			fmt.Println("    [ERROR] The pod runs on " + pinned + " (an earlier host folder is there), so this folder must be on " + pinned + " too.")
+		default:
+			if len(nodes) == 0 {
+				fmt.Println("    " + cWarn + "Couldn't list the cluster's nodes to check " + n + "; if it's wrong, the pod won't start.")
+			}
+			return n
+		}
+	}
+}
+
+// uniqueClaim avoids two volumes ending up as one claim (e.g. /a/lib and /b/lib).
+func uniqueClaim(plan *importPlan, claim string) string {
+	name := claim
+	for i := 2; plan.pvcs[name] != nil; i++ {
+		name = fmt.Sprintf("%s-%d", claim, i)
+	}
+	return name
 }
 
 var sizePattern = regexp.MustCompile(`^(\d+)\s*([KMGT]i?)?[bB]?$`)
