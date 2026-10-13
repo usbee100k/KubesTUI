@@ -555,17 +555,22 @@ func remoteFlow(opName string, pre remotePrefill) bool {
 		fmt.Println("[ OK ] Remote directory ready.")
 		fmt.Println()
 
-		// Workers: offer to create a fresh join token on a control plane, so no
-		// stored (possibly expired) join package or GitHub access is needed.
+		// Create a fresh join command on a control plane, so no stored
+		// (possibly expired) join package or GitHub access is needed. Control
+		// planes always get one: the certificate key in the bootstrap package
+		// expires 2 hours after bootstrap, so that copy rarely still works.
 		joinCmd := ""
+		controlPlane := remoteScript == "controlplane"
 
-		if remoteScript == "worker" {
+		if remoteScript == "worker" || controlPlane {
 
-			generate := false
+			generate := true
 
-			if pre.GenerateToken != nil {
+			switch {
+			case controlPlane:
+			case pre.GenerateToken != nil:
 				generate = *pre.GenerateToken
-			} else {
+			default:
 				gen := strings.ToLower(strings.TrimSpace(readRemoteValue(
 					reader,
 					"Generate a fresh join token from a control plane now? [Y/n]: ",
@@ -575,7 +580,7 @@ func remoteFlow(opName string, pre remotePrefill) bool {
 
 			if generate {
 
-				cmd, gerr := generateJoinCommand(reader, remoteUser, password)
+				cmd, gerr := generateJoinCommand(reader, remoteUser, password, controlPlane)
 
 				if gerr != nil {
 					fmt.Printf("[FAIL] Could not generate join token: %v\n", gerr)
@@ -733,13 +738,18 @@ func remoteFlow(opName string, pre remotePrefill) bool {
 
 			script := "#!/usr/bin/env bash\nset -euo pipefail\n" + joinCmd + "\n"
 
+			joinFile := "worker_join.sh"
+			if controlPlane {
+				joinFile = "controlplane_join.sh"
+			}
+
 			if err := uploadViaTmp(
 				client,
 				password,
 				script,
-				"/tmp/homelab-worker-join.sh",
+				"/tmp/homelab-"+joinFile,
 				remoteRoot+"/generated/secrets",
-				"worker_join.sh",
+				joinFile,
 				"700",
 			); err != nil {
 				fmt.Printf("[FAIL] Could not install join command: %v\n", err)
@@ -1623,13 +1633,19 @@ func trustAndDial(
 }
 
 // generateJoinCommand creates a fresh, short-lived bootstrap token on a
-// control plane and returns the validated "kubeadm join ..." command.
+// control plane and returns the validated "kubeadm join ..." command. For a
+// control plane it also re-uploads the cluster certificates (kubeadm keeps
+// them for 2 hours) and adds --control-plane --certificate-key.
 func generateJoinCommand(
 	reader *bufio.Reader,
 	defaultUser, defaultPassword string,
+	controlPlane bool,
 ) (string, error) {
 
 	const tokenCmd = "kubeadm token create --ttl 2h --print-join-command"
+	const certsCmd = "kubeadm init phase upload-certs --upload-certs"
+
+	var certsOutput string
 
 	// The token comes from an existing control plane. Running on one (the
 	// usual case), use it without asking; otherwise ask which one.
@@ -1663,6 +1679,22 @@ func generateJoinCommand(
 		}
 
 		output = string(raw)
+
+		if controlPlane {
+			fmt.Println("[INFO] Uploading control-plane certificates...")
+
+			certs := exec.Command("sudo", strings.Fields(certsCmd)...)
+			certs.Stdin = os.Stdin
+			certs.Stderr = os.Stderr
+
+			raw, err := certs.Output()
+
+			if err != nil {
+				return "", fmt.Errorf("uploading certificates: %v", err)
+			}
+
+			certsOutput = string(raw)
+		}
 
 	} else {
 
@@ -1712,9 +1744,48 @@ func generateJoinCommand(
 		}
 
 		output = out
+
+		if controlPlane {
+			fmt.Println("[INFO] Uploading control-plane certificates...")
+
+			out, err := sudoRun(client, password, certsCmd)
+
+			if err != nil {
+				return "", fmt.Errorf("uploading certificates: %v: %s", err, out)
+			}
+
+			certsOutput = out
+		}
 	}
 
-	return parseJoinCommand(output)
+	join, err := parseJoinCommand(output)
+
+	if err != nil || !controlPlane {
+		return join, err
+	}
+
+	key, err := parseCertificateKey(certsOutput)
+
+	if err != nil {
+		return "", err
+	}
+
+	return join + " --control-plane --certificate-key " + key, nil
+}
+
+var certificateKeyPattern = regexp.MustCompile(`(?m)^\s*([a-f0-9]{64})\s*$`)
+
+// parseCertificateKey finds the key printed by
+// "kubeadm init phase upload-certs --upload-certs" (its last line).
+func parseCertificateKey(output string) (string, error) {
+
+	m := certificateKeyPattern.FindAllStringSubmatch(output, -1)
+
+	if len(m) == 0 {
+		return "", fmt.Errorf("no certificate key in output: %s", strings.TrimSpace(output))
+	}
+
+	return m[len(m)-1][1], nil
 }
 
 // uploadViaTmp writes content to a temp file as the SSH user, then installs it

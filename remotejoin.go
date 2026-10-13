@@ -236,8 +236,6 @@ func showRemoteJoinForm(app *tview.Application, pages *tview.Pages, footer *tvie
 	height := 5 + 2 + 7 + 2 + 1 + 2
 	if role == "worker" {
 		height += 2
-	} else {
-		intro.SetText(strings.Replace(intro.GetText(false), "\n  [gray]A fresh join token is created on a control plane (valid 2h).[-]", "", 1))
 	}
 
 	rjPanel = centered(panel, 72, height)
