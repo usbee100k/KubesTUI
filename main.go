@@ -122,6 +122,14 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Change App Storage",
+		Desc:  "Choose where an app keeps each folder (like qBittorrent's /torrents): a Longhorn volume, copied to several nodes, or a folder on one node's own disk (the app then runs on that node). Saved in your GitOps repo and deployed by Argo CD. Also: E in the Command Center's Storage panel.",
+		Op:    "app-storage",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run app-storage",
+		},
+	},
+	{
 		Title: "VPN Status",
 		Desc:  "WireGuard (wg-easy) health: server, public endpoint, router forward target, connected clients and handshakes.",
 		Op:    "vpn-status",
@@ -2078,6 +2086,8 @@ func main() {
 			os.Exit(runComposeImport())
 		case "compose-remove":
 			os.Exit(runComposeRemove())
+		case "app-storage":
+			os.Exit(runAppStorage())
 		}
 	}
 
@@ -2222,6 +2232,13 @@ func main() {
 		return ""
 	}
 	openCC = func() { ccPage.Open(nodeCCSource(), cluster.Name, backToMain) }
+	ccPage.onStorage = func() {
+		for _, op := range operations {
+			if op.Op == "app-storage" {
+				showDetail(op) // same as picking it in the menu (dry-run applies)
+			}
+		}
+	}
 
 	tuiRunner = newRunner(app, pages, footer, backToDetail)
 	termPage = newTermScreen(app, pages, footer)

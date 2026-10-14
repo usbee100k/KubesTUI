@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -235,6 +236,8 @@ func demoScriptFor(op string) func(d *demoTerm) int {
 		return demoVPNStatus
 	case "os-update":
 		return demoOSUpdate
+	case "app-storage":
+		return demoAppStorage
 	}
 	return func(d *demoTerm) int {
 		d.Print("demo: no simulation for " + op + "\n")
@@ -467,6 +470,156 @@ func demoRepair(d *demoTerm) int {
 	}
 	d.Print(demoNodesTable(true))
 	d.Print(cGreen + "[ OK ]" + cReset + " Repair completed.\n")
+	return 0
+}
+
+// demoAppStorage mirrors `kubestui app-storage` (storage.go) run through
+// homelabCD's app_storage (lib/compose.sh).
+func demoAppStorage(d *demoTerm) int {
+	if !demoSudo(d) {
+		return d.exitCode()
+	}
+	type vol struct{ mount, now string }
+	apps := []struct {
+		name string
+		vols []vol
+	}{
+		{"jellyfin", []vol{{"/config", "Longhorn volume jellyfin-config, 10Gi"}, {"/media", "folder /mnt/hdd/media on w1"}}},
+		{"qbittorrent", []vol{{"/config, /gluetun [gluetun]", "Longhorn volume qbittorrent-config, 5Gi"}, {"/tmp/gluetun", "temporary (emptyDir, deleted with the pod)"}, {"/torrents", "Longhorn volume qbittorrent-downloads, 500Gi"}}},
+		{"sonarr", []vol{{"/config", "Longhorn volume sonarr-config, 5Gi"}, {"/downloads", "folder /apps/Appdata/qbittorrent/completed on w1"}, {"/shows", "folder /apps/Appdata/qbittorrent/completed/sonarr on w1"}}},
+	}
+	ask := func(q string) (string, bool) {
+		d.Print(q)
+		a, ok := d.ReadLine(true)
+		return strings.TrimSpace(a), ok
+	}
+	pick := func(q string, from, to int) (int, bool) {
+		for {
+			a, ok := ask(fmt.Sprintf("%s [%d-%d]: ", q, from, to))
+			if !ok {
+				return 0, false
+			}
+			if n, err := strconv.Atoi(a); err == nil && n >= from && n <= to {
+				return n, true
+			}
+			d.Print("  [ERROR] Enter a number from the list.\n")
+		}
+	}
+
+	d.Print(cBlue + "[INFO]" + cReset + " Updating the GitOps repository...\n")
+	d.Sleep(500 * time.Millisecond)
+	d.Print(cGreen + "[ OK ]" + cReset + " GitOps repository up to date (/home/admin/homelab-gitops)\n\n" +
+		"=============================================\n Change App Storage\n=============================================\n\n" +
+		"Choose where an app keeps a folder: a Longhorn volume (copied to\n" +
+		"several nodes, survives a node failure) or a folder on one node's\n" +
+		"own disk (the app then always runs on that node).\n\n")
+	for i, a := range apps {
+		d.Printf("  %2d) %-22s %d folder(s)\n", i+1, a.name, len(a.vols))
+	}
+	d.Print("\n")
+	n, ok := pick("App", 1, len(apps))
+	if !ok {
+		return d.exitCode()
+	}
+	app := apps[n-1]
+	d.Print("\n" + app.name + ":\n")
+	for i, v := range app.vols {
+		d.Printf("  %2d) %-34s -> %s\n", i+1, v.mount, v.now)
+	}
+	d.Print("\n")
+	if n, ok = pick("Folder to change", 1, len(app.vols)); !ok {
+		return d.exitCode()
+	}
+	v := app.vols[n-1]
+	d.Print("\n" + v.mount + " is now: " + v.now + "\n\n  1) Longhorn volume\n  2) Folder on a node's disk\n\n")
+	if n, ok = pick("New storage", 1, 2); !ok {
+		return d.exitCode()
+	}
+	first := strings.Fields(v.mount)[0]
+	base := first[strings.LastIndex(first, "/")+1:]
+	result, node, path := "", "", ""
+	if n == 1 {
+		d.Print("\n  0) New Longhorn volume\n")
+		var claims []string
+		for _, o := range app.vols {
+			if strings.HasPrefix(o.now, "Longhorn volume ") {
+				claims = append(claims, strings.TrimPrefix(o.now, "Longhorn volume "))
+			}
+		}
+		for i, c := range claims {
+			name, size, _ := strings.Cut(c, ", ")
+			d.Printf("  %d) %s (%s)\n", i+1, name, size)
+		}
+		d.Print("\n")
+		k, ok := pick("Volume", 0, len(claims))
+		if !ok {
+			return d.exitCode()
+		}
+		if k == 0 {
+			def := dnsName(app.name + "-" + base)
+			name, ok := ask("  Name for the new volume [" + def + "]: ")
+			if !ok {
+				return d.exitCode()
+			}
+			size, ok := ask("  Size [10Gi]: ")
+			if !ok {
+				return d.exitCode()
+			}
+			result = "Longhorn volume " + orDefault(dnsName(name), def) + ", " + normSize(orDefault(size, "10Gi"))
+		} else {
+			result = "Longhorn volume " + claims[k-1]
+		}
+	} else {
+		d.Print("\n  Nodes: cp1, cp2, cp3, w1, w2\n")
+		for {
+			a, ok := ask("  Node with the folder [w1]: ")
+			if !ok {
+				return d.exitCode()
+			}
+			node = strings.ToLower(orDefault(a, "w1"))
+			if !slices.Contains([]string{"cp1", "cp2", "cp3", "w1", "w2"}, node) {
+				d.Print("    [ERROR] " + node + " isn't a node in this cluster.\n")
+				continue
+			}
+			if app.name == "sonarr" && node != "w1" && v.mount != "/config" {
+				d.Print("    [ERROR] sonarr's other node folders are on w1, and a pod runs on one node, so this folder must be on w1 too.\n")
+				continue
+			}
+			break
+		}
+		for {
+			a, ok := ask("  Folder on " + node + " (full path, e.g. /mnt/data/shows): ")
+			if !ok {
+				return d.exitCode()
+			}
+			path = strings.TrimRight(a, "/")
+			if !strings.HasPrefix(path, "/") {
+				d.Print("    [ERROR] Enter a full path starting with /.\n")
+				continue
+			}
+			break
+		}
+		result = "folder " + path + " on " + node
+	}
+	d.Print("\n" + cGreen + "[ OK ]" + cReset + " " + v.mount + " -> " + result + "\n" +
+		"  Saved in apps/" + map[bool]string{true: "infrastructure", false: "applications"}[app.name == "qbittorrent"] + "/" + app.name + "/resources/storage-patch.yaml\n\n" +
+		cYellow + "[WARN]" + cReset + " Files in the old location are not copied to the new one.\n")
+	if path != "" {
+		d.Print("  The folder is created if it's missing. If " + app.name + " can't write to it, run on " + node + ":\n" +
+			"    sudo chown -R 1000:1000 " + path + "\n")
+	}
+	d.Print("\n")
+	if !d.Lines(700*time.Millisecond,
+		cGreen+"[ OK ]"+cReset+" Pushed: Change storage of "+app.name,
+		"",
+		cBlue+"[INFO]"+cReset+" Waiting for Argo CD to deploy "+app.name+" (Ctrl+C stops watching; it keeps deploying)...",
+		"  "+time.Now().Format("15:04:05")+"  OutOfSync / Healthy",
+		"  "+time.Now().Add(4*time.Second).Format("15:04:05")+"  Synced / Progressing",
+		"  "+time.Now().Add(19*time.Second).Format("15:04:05")+"  Synced / Healthy",
+	) {
+		return d.exitCode()
+	}
+	d.Print(cGreen + "[ OK ]" + cReset + " " + app.name + " is running.\n")
 	return 0
 }
 

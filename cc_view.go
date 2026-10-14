@@ -118,6 +118,10 @@ type commandCenter struct {
 
 	// actionsBlocked explains why changes aren't allowed ("" = allowed).
 	actionsBlocked func() string
+
+	// onStorage opens "Change App Storage" (E in the Storage panel);
+	// nil hides it.
+	onStorage func()
 }
 
 var ccPage *commandCenter
@@ -439,6 +443,10 @@ func (c *commandCenter) titleInfo(p ccPanelID) string {
 		return strings.Join(parts, " ")
 	case pNamespaces:
 		return "[gray]sort[-] " + nsSorts[c.nsSort]
+	case pStorage:
+		if c.onStorage != nil {
+			return "[aqua::b]E[-::-] [gray]change app storage[-]"
+		}
 	case pNodes:
 		if s != nil && s.Version != "" {
 			return "[gray]sort[-] " + nodeSorts[c.nodeSort]
@@ -1597,6 +1605,12 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			}
 		case r == 'n' || r == 'N':
 			c.nsFilter = ""
+		case r == 'e' || r == 'E':
+			if c.focus == pStorage && c.onStorage != nil {
+				open := c.onStorage
+				c.Close()
+				open()
+			}
 		}
 	}
 	return nil

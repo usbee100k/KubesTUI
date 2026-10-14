@@ -610,6 +610,7 @@ func (w *workstation) actions() []wsAction {
 		{title: "Move Node to Dedicated Longhorn Disk", desc: "Format a spare disk and move a node's Longhorn data onto it", op: "longhorn-disk", confirm: true},
 		{title: "Repair Control Plane Node", desc: "Restart containerd and kubelet on " + w.current.Host, op: "repair", confirm: true},
 		{title: "Import Docker Compose App", desc: "Deploy a docker-compose.yml from this computer into the cluster through GitOps", run: w.importCompose},
+		{title: "Change App Storage", desc: "Where an app keeps each folder: a Longhorn volume or a folder on a node's disk (also E in the Command Center's Storage panel)", op: "app-storage", confirm: true},
 		{title: "Remove Imported App", desc: "Remove an app imported from Docker Compose (and its data)", op: "compose-remove", confirm: true},
 		{title: "VPN", desc: w.vpnSummary(), run: func() { w.vpnScreen().Show() }},
 		{title: "Set Up Torrent VPN (PIA)", desc: "Private Internet Access login for qBittorrent (it only runs through the VPN)", op: "torrent-vpn", confirm: true},
@@ -747,6 +748,9 @@ func (w *workstation) openCommandCenter() {
 	if err != nil {
 		w.clusterNote.SetText("  [yellow]" + tview.Escape(err.Error()) + "[-]")
 		return
+	}
+	ccPage.onStorage = func() {
+		w.runAction(wsAction{title: "Change App Storage", op: "app-storage"})
 	}
 	ccPage.Open(src, p.Name, w.showCluster)
 }
