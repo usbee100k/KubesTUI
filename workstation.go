@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
@@ -91,7 +92,19 @@ func setupWorkstation(app *tview.Application) *workstation {
 	termPage = newTermScreen(app, w.pages, w.footer)
 	ccPage = newCommandCenter(app, w.pages, w.footer)
 	sshPage = newSSHConsole(app, w.pages, w.footer, w.showCluster)
-	sshPage.nodesFn = func() ([]nodeRow, error) { return w.nodeCache, w.nodeErr }
+	sshPage.nodesFn = func() ([]nodeRow, error) {
+		if p := w.current; p != nil {
+			return w.sshConsoleNodes(p)
+		}
+		return nil, errors.New("no cluster selected")
+	}
+	// Shown at once: the activity lights' latest poll of this cluster.
+	sshPage.cachedFn = func() []nodeRow {
+		if w.current != nil && w.activityFor == w.current {
+			return w.activity.last
+		}
+		return nil
+	}
 	sshPage.connectFn = w.connectNode
 	sshPage.keyFn = w.installKeyOnNode
 	sshPage.keyLoginFn = func(host string) bool { return w.current != nil && w.current.demo && w.demoKeys[host] }
@@ -610,6 +623,7 @@ func (w *workstation) actions() map[string][]wsAction {
 			{title: "Open Shell on Control Plane", desc: "A terminal on " + host, run: w.openShell},
 			{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
 			{title: "Open k9s", desc: "Browse pods, logs and events in k9s on this computer (downloads it the first time)", run: w.openK9s},
+			{title: "Transfer Files to a Node", desc: "Drop files or folders from this computer and copy them to any node over SSH (default /home/<user>/)", run: w.transferFiles},
 		},
 		secCluster: {
 			{title: "Cluster Health Check", desc: "Nodes, control plane, networking, DNS, Argo CD, storage, certificates", op: "health"},
@@ -818,36 +832,37 @@ func (w *workstation) showKubectl() {
 // ---------------------------------------------------------------------------
 
 func (w *workstation) openSSHConsole() {
-	p := w.current
-	sshPage.demo = p.demo
-	if p.demo {
-		w.nodeCache, w.nodeErr = demoNodes, nil
-		sshPage.Show()
-		sshPage.note.SetText("  [black:yellow:b] DEMO [-:-:-] [gray] Simulated nodes. ENTER opens a demo shell, K simulates key setup.[-]")
-		return
-	}
-	w.nodeCache, w.nodeErr = nil, fmt.Errorf("loading nodes from %s…", p.Host)
+	sshPage.demo = w.current.demo
 	sshPage.Show()
+}
 
-	go func() {
-		var rows []nodeRow
-		client, err := w.dialer(p)()
-		if err == nil {
-			var out string
-			out, err = runRemote(client,
-				"kubectl get nodes -o json 2>/dev/null || sudo -n kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o json", "")
-			client.Close()
-			if err == nil {
-				rows, err = parseNodes([]byte(out))
-			}
+// sshConsoleNodes loads the node list for the SSH Console (in the
+// background): straight from the cluster API with this computer's
+// credential, which takes milliseconds, like the activity lights; over
+// SSH and kubectl on the control plane only if that isn't possible.
+func (w *workstation) sshConsoleNodes(p *clusterProfile) ([]nodeRow, error) {
+	if p.demo {
+		return demoNodes, nil
+	}
+	rows, err := workstationNodeSource(p)()
+	if err != nil {
+		client, derr := w.dialer(p)()
+		if derr != nil {
+			return nil, err
 		}
-		w.app.QueueUpdateDraw(func() {
-			w.nodeCache, w.nodeErr = rows, err
-			if name, _ := w.pages.GetFrontPage(); name == "ssh" {
-				sshPage.refresh()
-			}
-		})
-	}()
+		var out string
+		out, err = runRemote(client,
+			"kubectl get nodes -o json 2>/dev/null || sudo -n kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o json", "")
+		client.Close()
+		if err != nil {
+			return nil, err
+		}
+		rows, err = parseNodes([]byte(out))
+	}
+	if err == nil {
+		w.app.QueueUpdate(func() { w.nodeCache, w.nodeErr = rows, nil })
+	}
+	return rows, err
 }
 
 func (w *workstation) connectNode(e hostEntry) {
@@ -909,7 +924,7 @@ func (w *workstation) installKeyOnNode(e hostEntry) {
 			saved := store.upsert(e)
 			saved.KeyLogin = true
 			_ = store.save()
-			sshPage.refresh()
+			sshPage.redraw()
 			sshPage.note.SetText("  [green]Key installed on " + tview.Escape(e.Host) + "; future connections need no password.[-]")
 		})
 	}()

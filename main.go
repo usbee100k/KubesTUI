@@ -2270,6 +2270,7 @@ func main() {
 	tuiRunner = newRunner(app, pages, footer, backToDetail)
 	termPage = newTermScreen(app, pages, footer)
 	sshPage = newSSHConsole(app, pages, footer, backToMain)
+	sshPage.cachedFn = func() []nodeRow { return activity.last } // shown at once
 	sharer = newSharePage(app, pages, footer, backToMain)
 	openRemoteJoin = func(op operation) {
 		back := func() { backToDetail(op) }

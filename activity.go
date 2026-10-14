@@ -50,6 +50,7 @@ type activityPanel struct {
 	hint   func(error) string        // explains a failed poll
 
 	seen   map[string]time.Time // when each node first appeared
+	last   []nodeRow            // the latest node list (for other screens)
 	polled bool                 // the first poll only records nodes, never as NEW
 	beat   bool
 	stop   chan struct{} // closes the running poll loop
@@ -130,6 +131,9 @@ func (a *activityPanel) update(rows []nodeRow, err error) {
 		}
 	}
 	a.polled = true
+	if err == nil {
+		a.last = rows
+	}
 
 	pulse := "[green]●[-]"
 	if !a.beat {

@@ -215,6 +215,15 @@ type sshConsole struct {
 	store *hostStore
 	rows  []nodeRow
 
+	// The cluster's nodes: shown at once from cachedFn (the activity
+	// lights' latest poll), then refreshed in the background by nodesFn,
+	// so opening the console never waits on the network.
+	nodes    []nodeRow
+	nodesErr error
+	loaded   bool
+	loadSeq  int
+	cachedFn func() []nodeRow
+
 	// Swappable for workstation mode (see workstation.go).
 	nodesFn     func() ([]nodeRow, error)
 	connectFn   func(e hostEntry)
@@ -267,17 +276,52 @@ func (c *sshConsole) footerText() string {
 func (c *sshConsole) Show() {
 	c.pages.AddAndSwitchToPage("ssh", c.screen, true)
 	c.footer.SetText(c.footerText())
+	c.nodes, c.nodesErr, c.loaded = nil, nil, false
 	c.refresh()
 	c.app.SetFocus(c.table)
 }
 
+// refresh shows what's known now and reloads the node list in the
+// background (R, and when the console opens).
 func (c *sshConsole) refresh() {
+	if !c.loaded && c.cachedFn != nil {
+		if rows := c.cachedFn(); len(rows) > 0 {
+			c.nodes, c.nodesErr, c.loaded = rows, nil, true
+		}
+	}
+	c.redraw()
+
+	c.loadSeq++
+	seq, fn := c.loadSeq, c.nodesFn
+	go func() {
+		nodes, err := fn()
+		c.app.QueueUpdateDraw(func() {
+			if seq != c.loadSeq {
+				return // a newer load started
+			}
+			if err != nil && c.loaded && len(c.nodes) > 0 {
+				c.note.SetText("  [yellow]Couldn't refresh the node list (" + tview.Escape(strings.TrimSpace(err.Error())) + "); showing the last one.[-]")
+				return
+			}
+			c.nodes, c.nodesErr, c.loaded = nodes, err, true
+			c.redraw()
+		})
+	}()
+}
+
+// redraw rebuilds the table from the known nodes and saved hosts.
+func (c *sshConsole) redraw() {
 	c.store = loadHostStore()
 
-	nodes, err := c.nodesFn()
-	if err != nil {
-		c.note.SetText("  [yellow]Cluster nodes unavailable (kubectl: " + tview.Escape(strings.TrimSpace(err.Error())) + "). Showing saved hosts.[-]")
-	} else {
+	nodes, err := c.nodes, c.nodesErr
+	switch {
+	case !c.loaded:
+		c.note.SetText("  [gray]Loading cluster nodes…[-]")
+	case err != nil:
+		c.note.SetText("  [yellow]Cluster nodes unavailable (" + tview.Escape(strings.TrimSpace(err.Error())) + "). Showing saved hosts.[-]")
+	case c.demo:
+		c.note.SetText("  [black:yellow:b] DEMO [-:-:-] [gray] Simulated nodes. ENTER opens a demo shell, K simulates key setup.[-]")
+	default:
 		path := c.store.path
 		if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(path, home+"/") {
 			path = "~" + strings.TrimPrefix(path, home)
@@ -557,7 +601,7 @@ func (c *sshConsole) showDialog(form *tview.Form, title string, height int) {
 func (c *sshConsole) closeDialogAndRefresh() {
 	c.pages.RemovePage("sshform")
 	c.footer.SetText(c.footerText())
-	c.refresh()
+	c.redraw()
 	c.app.SetFocus(c.table)
 }
 
@@ -640,7 +684,7 @@ func (c *sshConsole) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			if r != nil && r.custom {
 				c.store.remove(r.host)
 				_ = c.store.save()
-				c.refresh()
+				c.redraw()
 			} else if r != nil {
 				c.note.SetText("  [yellow]Cluster nodes can't be removed here; only hosts you added.[-]")
 			}
