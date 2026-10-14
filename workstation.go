@@ -40,6 +40,7 @@ type workstation struct {
 	cluster     *tview.Flex
 	clusterInfo *tview.TextView
 	clusterList *tview.List
+	menu        *tabbedMenu // section tabs over clusterList
 	clusterNote *tview.TextView
 	current     *clusterProfile
 
@@ -542,13 +543,14 @@ func (w *workstation) buildCluster() {
 		SetSelectedTextColor(tcell.ColorBlack).
 		SetSelectedBackgroundColor(tcell.ColorAqua)
 
-	header := tview.NewTextView().SetDynamicColors(true).SetText("\n  [yellow::b]OPERATIONS[-::-]")
+	w.menu = newTabbedMenu(w.clusterList, true)
 
 	body := &clusterBody{Flex: frame("HOMELAB KUBERNETES PLATFORM"), top: tview.NewFlex(),
 		info: w.clusterInfo, lights: w.activity.view, lines: 2}
 	body.AddItem(nil, 1, 0, false).
 		AddItem(body.top, 7, 0, false).
-		AddItem(header, 2, 0, false).
+		AddItem(nil, 1, 0, false).
+		AddItem(w.menu.bar, 2, 0, false).
 		AddItem(w.clusterList, 0, 1, true).
 		AddItem(w.clusterNote, 2, 0, false)
 
@@ -599,29 +601,44 @@ func (c *clusterBody) Draw(screen tcell.Screen) {
 	c.Flex.Draw(screen)
 }
 
-func (w *workstation) actions() []wsAction {
-	return []wsAction{
-		{title: "Command Center", desc: "Live view of everything: nodes, IPs, CPU/memory/disk/network, pods, namespaces, Argo CD apps, LAN IPs, storage and alerts", run: w.openCommandCenter},
-		{title: "Cluster Health Check", desc: "Nodes, control plane, networking, DNS, Argo CD, storage, certificates", op: "health"},
-		{title: "Cluster Configuration", desc: "config/cluster.yaml and the live kubeadm configuration", op: "config"},
-		{title: "Generate Join Commands", desc: "Fresh join commands for new nodes", op: "join-commands"},
-		{title: "Remote Join Worker", desc: "Add a new worker over SSH; runs on " + w.current.Host, run: func() { w.remoteJoin("remote-worker", "Remote Join Worker") }},
-		{title: "Remote Join Control Plane", desc: "Add a new control plane over SSH; runs on " + w.current.Host, run: func() { w.remoteJoin("remote-controlplane", "Remote Join Control Plane") }},
-		{title: "Move Node to Dedicated Longhorn Disk", desc: "Format a spare disk and move a node's Longhorn data onto it", op: "longhorn-disk", confirm: true},
-		{title: "Repair Control Plane Node", desc: "Restart containerd and kubelet on " + w.current.Host, op: "repair", confirm: true},
-		{title: "Import Docker Compose App", desc: "Deploy a docker-compose.yml from this computer into the cluster through GitOps", run: w.importCompose},
-		{title: "Change App Storage", desc: "Where an app keeps each folder: a Longhorn volume or a folder on a node's disk (also E in the Command Center's Storage panel)", op: "app-storage", confirm: true},
-		{title: "Remove Imported App", desc: "Remove an app imported from Docker Compose (and its data)", op: "compose-remove", confirm: true},
-		{title: "VPN", desc: w.vpnSummary(), run: func() { w.vpnScreen().Show() }},
-		{title: "Set Up Torrent VPN (PIA)", desc: "Private Internet Access login for qBittorrent (it only runs through the VPN)", op: "torrent-vpn", confirm: true},
-		{title: "Open Shell on Control Plane", desc: "A terminal on " + w.current.Host, run: w.openShell},
-		{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
-		{title: "Open k9s", desc: "Browse pods, logs and events in k9s on this computer (downloads it the first time)", run: w.openK9s},
-		{title: "Update Operating System", desc: "apt update and apt upgrade -y on all nodes or the ones you pick, one at a time; lists nodes that need a reboot", op: "os-update", confirm: true},
-		{title: "Update homelabCD and KubesTUI", desc: "Pull the latest homelabCD and rebuild KubesTUI on " + w.current.Host + " (settings are kept)", op: "update", confirm: true},
-		{title: "Update GitOps Templates", desc: "Merge new homelabCD templates into your GitOps repo; your edits and settings are kept", op: "gitops-update", confirm: true},
-		{title: "Update KubesTUI on This Computer", desc: "Build the newest KubesTUI on " + w.current.Host + " and install it here (" + version + " now)", run: w.selfUpdate},
-		{title: "Back to Clusters", desc: "", run: w.showHome},
+// actions lists the cluster page's items by section.
+func (w *workstation) actions() map[string][]wsAction {
+	host := w.current.Host
+	return map[string][]wsAction{
+		secCommandCenter: {
+			{title: "Command Center", desc: "Live view of everything: nodes, IPs, CPU/memory/disk/network, pods, namespaces, Argo CD apps, LAN IPs, storage and alerts", run: w.openCommandCenter},
+			{title: "Open Shell on Control Plane", desc: "A terminal on " + host, run: w.openShell},
+			{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
+			{title: "Open k9s", desc: "Browse pods, logs and events in k9s on this computer (downloads it the first time)", run: w.openK9s},
+		},
+		secCluster: {
+			{title: "Cluster Health Check", desc: "Nodes, control plane, networking, DNS, Argo CD, storage, certificates", op: "health"},
+			{title: "Cluster Configuration", desc: "config/cluster.yaml and the live kubeadm configuration", op: "config"},
+			{title: "Repair Control Plane Node", desc: "Restart containerd and kubelet on " + host, op: "repair", confirm: true},
+			{title: "Move Node to Dedicated Longhorn Disk", desc: "Format a spare disk and move a node's Longhorn data onto it", op: "longhorn-disk", confirm: true},
+			{title: "Import Docker Compose App", desc: "Deploy a docker-compose.yml from this computer into the cluster through GitOps", run: w.importCompose},
+			{title: "Change App Storage", desc: "Where an app keeps each folder: a Longhorn volume or a folder on a node's disk (also E in the Command Center's Storage panel)", op: "app-storage", confirm: true},
+			{title: "Remove Imported App", desc: "Remove an app imported from Docker Compose (and its data)", op: "compose-remove", confirm: true},
+			{title: "Back to Clusters", desc: "The list of clusters on this computer (ESC)", run: w.showHome},
+		},
+		secVPN: {
+			{title: "VPN", desc: w.vpnSummary(), run: func() { w.vpnScreen().Show() }},
+			{title: "Set Up Torrent VPN (PIA)", desc: "Private Internet Access login for qBittorrent (it only runs through the VPN)", op: "torrent-vpn", confirm: true},
+		},
+		secUpdate: {
+			{title: "Update Operating System", desc: "apt update and apt upgrade -y on all nodes or the ones you pick, one at a time; then optional safe reboots", op: "os-update", confirm: true},
+			{title: "Update homelabCD and KubesTUI", desc: "Pull the latest homelabCD and rebuild KubesTUI on " + host + " (settings are kept)", op: "update", confirm: true},
+			{title: "Update GitOps Templates", desc: "Merge new homelabCD templates into your GitOps repo; your edits and settings are kept", op: "gitops-update", confirm: true},
+			{title: "Update KubesTUI on This Computer", desc: "Build the newest KubesTUI on " + host + " and install it here (" + version + " now)", run: w.selfUpdate},
+		},
+		secRemoteJoin: {
+			{title: "Remote Join Worker", desc: "Add a new worker over SSH; runs on " + host, run: func() { w.remoteJoin("remote-worker", "Remote Join Worker") }},
+			{title: "Remote Join Control Plane", desc: "Add a new control plane over SSH; runs on " + host, run: func() { w.remoteJoin("remote-controlplane", "Remote Join Control Plane") }},
+			{title: "Generate Join Commands", desc: "Fresh join commands for new nodes", op: "join-commands"},
+		},
+		secBootstrappers: {
+			{title: "Bootstrap or Join on a Node", desc: "Bootstrapping a cluster and local joins run on the node itself: open an SSH session there and run kbtui", run: w.openSSHConsole},
+		},
 	}
 }
 
@@ -652,15 +669,14 @@ func (w *workstation) showCluster() {
 			row("KUBECONFIG", kube) +
 			row("MODE", w.modeText()))
 
-	selected := w.clusterList.GetCurrentItem()
-	w.clusterList.Clear()
-	for _, a := range w.actions() {
-		a := a
-		w.clusterList.AddItem("  "+a.title, "    "+a.desc, 0, func() { w.runAction(a) })
+	bySection := map[string][]menuItem{}
+	for sec, actions := range w.actions() {
+		for _, a := range actions {
+			a := a
+			bySection[sec] = append(bySection[sec], menuItem{title: a.title, desc: a.desc, run: func() { w.runAction(a) }})
+		}
 	}
-	if selected >= 0 && selected < w.clusterList.GetItemCount() {
-		w.clusterList.SetCurrentItem(selected)
-	}
+	w.menu.setSections(sectionsFrom(bySection))
 	w.clusterNote.SetText(w.pendingNote)
 	w.pendingNote = ""
 
@@ -674,7 +690,7 @@ func (w *workstation) showCluster() {
 	}
 
 	w.pages.AddAndSwitchToPage("cluster", w.cluster, true)
-	w.footer.SetText(" [aqua::b]UP/DOWN[-::-] Navigate    [aqua::b]ENTER[-::-] Select    [aqua::b]ESC[-::-] Clusters    [aqua::b]Q[-::-] Quit")
+	w.footer.SetText(menuFooter("    [aqua::b]ESC[-::-] Clusters"))
 	w.app.SetFocus(w.clusterList)
 	w.checkReachable()
 }

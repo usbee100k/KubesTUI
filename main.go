@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -2058,6 +2059,9 @@ func footerText(page string, op operation) string {
 	if page == "detail" && (!dryRun || op.ReadOnly) {
 		return " [aqua::b]ENTER[-::-] Execute    [aqua::b]ESC[-::-] Back    [aqua::b]Q[-::-] Quit"
 	}
+	if page == "main" {
+		return menuFooter("    [aqua::b]D[-::-] Dry-run/Live")
+	}
 	return " [aqua::b]UP/DOWN[-::-] Navigate    [aqua::b]ENTER[-::-] Select    [aqua::b]ESC[-::-] Back    [aqua::b]Q[-::-] Quit"
 }
 
@@ -2140,9 +2144,6 @@ func main() {
 	info := tview.NewTextView().SetDynamicColors(true)
 	info.SetText(infoText())
 
-	opsHeader := tview.NewTextView().SetDynamicColors(true)
-	opsHeader.SetText("\n  [yellow::b]OPERATIONS[-::-]")
-
 	list := tview.NewList().
 		ShowSecondaryText(false).
 		SetHighlightFullLine(true).
@@ -2168,16 +2169,41 @@ func main() {
 	}
 
 	var openCC func()
-	list.AddItem("  Command Center", "", 0, func() { openCC() })
-	for _, op := range operations {
-		op := op
-		list.AddItem("  "+op.Title, "", 0, func() { showDetail(op) })
-	}
-	list.AddItem("  SSH Console", "", 0, func() { sshPage.Show() })
-	list.AddItem("  Share KubesTUI with a Workstation", "", 0, func() { sharer.Start() })
-	list.AddItem("  "+toggleTitle, "", 0, func() {
+	toggle := func() {
 		dryRun = !dryRun
 		info.SetText(infoText())
+	}
+	bySection := map[string][]menuItem{
+		secCommandCenter: {
+			{title: "Command Center", run: func() { openCC() }},
+			{title: "SSH Console", run: func() { sshPage.Show() }},
+			{title: "Share KubesTUI with a Workstation", run: func() { sharer.Start() }},
+		},
+	}
+	clusterOps := []operation{}
+	for _, op := range operations {
+		op := op
+		if sec := opSection(op.Op); sec != secCluster {
+			bySection[sec] = append(bySection[sec], menuItem{title: op.Title, run: func() { showDetail(op) }})
+		} else {
+			clusterOps = append(clusterOps, op)
+		}
+	}
+	sort.SliceStable(clusterOps, func(i, j int) bool { return clusterRank(clusterOps[i].Op) < clusterRank(clusterOps[j].Op) })
+	for _, op := range clusterOps {
+		op := op
+		bySection[secCluster] = append(bySection[secCluster], menuItem{title: op.Title, run: func() { showDetail(op) }})
+	}
+	bySection[secCluster] = append(bySection[secCluster], menuItem{title: toggleTitle + "  (D)", run: toggle})
+	menu := newTabbedMenu(list, false)
+	menu.setSections(sectionsFrom(bySection))
+	tabsCapture := list.GetInputCapture()
+	list.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		if ev.Key() == tcell.KeyRune && (ev.Rune() == 'd' || ev.Rune() == 'D') {
+			toggle()
+			return nil
+		}
+		return tabsCapture(ev)
 	})
 
 	// Header: cluster info on the left, live node lights on the right.
@@ -2189,7 +2215,8 @@ func main() {
 	body := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(nil, 1, 0, false).
 		AddItem(top, 6, 0, false).
-		AddItem(opsHeader, 2, 0, false).
+		AddItem(nil, 1, 0, false).
+		AddItem(menu.bar, 2, 0, false).
 		AddItem(list, 0, 1, true)
 	body.SetBorder(true).
 		SetTitle(platformTitle()).
