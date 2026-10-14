@@ -263,6 +263,7 @@ func (l localFS) DiskUsage(paths []string) (int64, error) {
 type memFS struct {
 	label string
 	home  string
+	root  string
 	mu    sync.Mutex
 	tree  map[string][]fsEntry
 }
@@ -285,6 +286,30 @@ func demoNodeFS(label string) *memFS {
 	}
 	demoFSAll[label] = m
 	return m
+}
+
+// demoVolumeFS is a demo Longhorn volume: a small config tree at /data.
+func demoVolumeFS(label string) *memFS {
+	demoFSMu.Lock()
+	defer demoFSMu.Unlock()
+	if m := demoFSAll[label]; m != nil {
+		return m
+	}
+	m := &memFS{label: label, home: "/data", root: "/data", tree: map[string][]fsEntry{
+		"/":                {{name: "data", dir: true}},
+		"/data":            {{name: "lost+found", dir: true, size: 16384}},
+		"/data/lost+found": nil,
+	}}
+	demoFSAll[label] = m
+	return m
+}
+
+// Root is the top a pane may go up to.
+func (m *memFS) Root() string {
+	if m.root != "" {
+		return m.root
+	}
+	return "/"
 }
 
 func (m *memFS) Label() string { return m.label }

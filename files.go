@@ -20,9 +20,35 @@ import (
 
 // fmLocation is a place a pane can show.
 type fmLocation struct {
-	label string // "This computer" or the node's name
-	light string // status light markup ("" for this computer)
-	open  func() (fileSys, error)
+	label  string // "This computer", a node's name, or "vol <ns>/<claim>"
+	light  string // status light markup ("" for this computer)
+	note   string // shown after the label in the device list
+	volume bool
+	open   func() (fileSys, error)
+}
+
+// firstVolume as a start location: the first Longhorn volume.
+const firstVolume = "vol:"
+
+// volumeLabel is the start location for a volume ("" = the first one).
+func volumeLabel(ns, pvc string) string {
+	if ns == "" {
+		return firstVolume
+	}
+	return "vol " + ns + "/" + pvc
+}
+
+// fmOptions configures Files.
+type fmOptions struct {
+	locations []fmLocation
+	// more loads extra locations in the background (Longhorn volumes).
+	more   func() ([]fmLocation, error)
+	kube   kubeRunner
+	isNode func(string) bool
+	// start: the location labels the panes open on ("" = the defaults:
+	// the first location, then the second).
+	start [2]string
+	back  func()
 }
 
 type fmPane struct {
@@ -75,9 +101,8 @@ func (fm *fileManager) log(line string) {
 
 // openFileManager shows Files. Pane 1 starts on the first location, pane 2
 // on the second (the first node), so copying across is one key away.
-func openFileManager(app *tview.Application, pages *tview.Pages, footer *tview.TextView,
-	locations []fmLocation, kube kubeRunner, isNode func(string) bool, back func()) {
-
+func openFileManager(app *tview.Application, pages *tview.Pages, footer *tview.TextView, opt fmOptions) {
+	locations, kube, isNode, back := opt.locations, opt.kube, opt.isNode, opt.back
 	fm := &fileManager{app: app, pages: pages, footer: footer, back: back,
 		locations: locations, kube: kube, isNode: isNode}
 	fm.note = tview.NewTextView().SetDynamicColors(true)
@@ -127,11 +152,40 @@ func openFileManager(app *tview.Application, pages *tview.Pages, footer *tview.T
 	pages.AddAndSwitchToPage("files", fm.screen, true)
 	fm.setFooter()
 	fm.focus(0)
-	fm.panes[0].openLocation(0)
-	if len(locations) > 1 {
-		fm.panes[1].openLocation(1)
-	} else {
-		fm.panes[1].openLocation(0)
+	// Default devices; a requested one (e.g. a volume from the Command
+	// Center) opens once it's in the list.
+	openStart := func(pane int, def int) bool { // false: wait for more
+		want := opt.start[pane]
+		for i, l := range fm.locations {
+			if want != "" && (l.label == want || (want == firstVolume && l.volume)) {
+				fm.panes[pane].openLocation(i)
+				return true
+			}
+		}
+		if want == "" || opt.more == nil {
+			fm.panes[pane].openLocation(min(def, len(fm.locations)-1))
+			return true
+		}
+		return false
+	}
+	waiting := [2]bool{!openStart(0, 0), !openStart(1, 1)}
+	if opt.more != nil {
+		go func() {
+			more, err := opt.more()
+			fm.app.QueueUpdateDraw(func() {
+				if err != nil {
+					fm.flash("[yellow]Longhorn volumes unavailable: " + tview.Escape(err.Error()) + "[-]")
+				}
+				fm.locations = append(fm.locations, more...)
+				for pane := range fm.panes {
+					if waiting[pane] && !openStart(pane, pane) {
+						// The wanted volume isn't there: the default.
+						fm.panes[pane].openLocation(min(pane, len(fm.locations)-1))
+						fm.flash("[yellow]" + tview.Escape(opt.start[pane]) + " wasn't found.[-]")
+					}
+				}
+			})
+		}()
 	}
 }
 
@@ -221,11 +275,22 @@ func (p *fmPane) openLocation(i int) {
 	}()
 }
 
+// root is the top of the pane's device ("/", or /data for a volume).
+func (p *fmPane) root() string {
+	if r, ok := p.fs.(interface{ Root() string }); ok {
+		return r.Root()
+	}
+	return "/"
+}
+
 func (p *fmPane) cd(dir string) {
 	if p.fs == nil {
 		return
 	}
 	dir = path.Clean("/" + dir)
+	if root := p.root(); dir != root && !strings.HasPrefix(dir, strings.TrimSuffix(root, "/")+"/") {
+		dir = root // a volume: nothing above it
+	}
 	if dir != p.dir {
 		p.marks = map[string]bool{}
 	}
@@ -336,7 +401,7 @@ func (p *fmPane) render() {
 			}
 			p.table.SetCell(0, i, c)
 		}
-		if p.dir != "/" && f == "" {
+		if p.dir != p.root() && f == "" {
 			p.shown = append(p.shown, -1)
 			p.table.SetCell(1, 0, tview.NewTableCell(" ../").SetTextColor(tcell.ColorAqua).SetExpansion(1))
 			p.table.SetCell(1, 1, tview.NewTableCell(""))
@@ -699,25 +764,36 @@ func (fm *fileManager) pickLocation() {
 		SetSelectedBackgroundColor(tcell.ColorAqua).SetSelectedTextColor(tcell.ColorBlack)
 	closeList := func() { fm.pages.RemovePage("fmloc"); fm.focus(fm.active) }
 	p := fm.cur()
+	shownVolumes := false
 	for i, l := range fm.locations {
 		i := i
+		if l.volume && !shownVolumes {
+			shownVolumes = true
+			list.AddItem("  [yellow::b]Longhorn volumes[-::-]", "", 0, nil)
+		}
 		light := l.light
 		if light == "" {
 			light = "■"
 		}
 		text := "  " + light + " " + tview.Escape(l.label)
 		if l.label == p.loc {
-			text += "  [gray](showing)[-]"
-			defer list.SetCurrentItem(i)
+			text += "  [aqua](showing)[-]"
+			defer list.SetCurrentItem(list.GetItemCount()) // this item's row
 		} else if l.label == fm.other().loc {
 			text += "  [gray](other pane)[-]"
 		}
+		if l.note != "" {
+			text += "  [gray]" + tview.Escape(l.note) + "[-]"
+		}
 		list.AddItem(text, "", 0, func() { closeList(); p.openLocation(i) })
+	}
+	if !shownVolumes && fm.kube != nil {
+		list.AddItem("  [gray]Longhorn volumes: loading… (open this list again)[-]", "", 0, nil)
 	}
 	list.SetDoneFunc(closeList)
 	side := map[int]string{0: "LEFT", 1: "RIGHT"}[p.idx]
 	list.SetBorder(true).SetTitle(" DEVICE FOR THE " + side + " PANE ").SetTitleAlign(tview.AlignLeft)
-	fm.pages.AddPage("fmloc", centered(list, 52, min(len(fm.locations)+2, 20)), true, true)
+	fm.pages.AddPage("fmloc", centered(list, 84, min(list.GetItemCount()+2, 24)), true, true)
 	fm.app.SetFocus(list)
 }
 

@@ -53,8 +53,18 @@ type sshFS struct {
 	node   hostEntry // how to reach it (for new connections)
 	keys   []string
 	home   string
-	mu     sync.Mutex
-	sudo   int // 0 unknown, 1 sudo -n works, -1 it doesn't
+
+	// A Longhorn volume instead of a node (files_vol.go): commands run in
+	// a helper pod, nothing outside root is shown, and closing removes
+	// the pod.
+	exec    func(cmd string) (string, error)
+	root    string
+	onClose func()
+	vol     *volInfo
+	pod     string // the helper pod
+	stream  kubeStreamer
+	mu      sync.Mutex
+	sudo    int // 0 unknown, 1 sudo -n works, -1 it doesn't
 }
 
 func openSSHFS(node hostEntry, keys []string) (*sshFS, error) {
@@ -73,11 +83,29 @@ func openSSHFS(node hostEntry, keys []string) (*sshFS, error) {
 }
 
 func (f *sshFS) Home() string { return f.home }
-func (f *sshFS) Close()       { f.client.Close() }
+func (f *sshFS) Close() {
+	if f.client != nil {
+		f.client.Close()
+	}
+	if f.onClose != nil {
+		f.onClose()
+	}
+}
+
+// Root is the top a pane may go up to ("/" for nodes).
+func (f *sshFS) Root() string {
+	if f.root != "" {
+		return f.root
+	}
+	return "/"
+}
 
 // run runs a read-only command, retrying with sudo -n (no password) when
 // the SSH user may not read there.
 func (f *sshFS) run(cmd string) (string, error) {
+	if f.exec != nil {
+		return f.exec(cmd)
+	}
 	out, err := runRemote(f.client, cmd, "")
 	if err == nil || !strings.Contains(err.Error(), "ermission denied") {
 		return out, err

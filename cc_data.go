@@ -128,6 +128,29 @@ type ccVolume struct {
 	Size, Actual                           int64
 	Replicas                               int
 	Longhorn                               bool
+	Copies                                 []string // node of each replica (Longhorn)
+}
+
+// copiesOn says where a volume's copies are ("toji×2 gojo") and on how
+// many different nodes.
+func (v ccVolume) copiesOn() (string, int) {
+	count := map[string]int{}
+	var order []string
+	for _, n := range v.Copies {
+		if count[n] == 0 {
+			order = append(order, n)
+		}
+		count[n]++
+	}
+	sort.Strings(order)
+	var parts []string
+	for _, n := range order {
+		if count[n] > 1 {
+			n += fmt.Sprintf("×%d", count[n])
+		}
+		parts = append(parts, n)
+	}
+	return strings.Join(parts, " "), len(order)
 }
 
 type ccDisk struct {
@@ -183,6 +206,10 @@ type ccSnapshot struct {
 	Alerts     []ccAlert
 
 	HasMetrics, HasApps, HasLonghorn, HasCerts bool
+
+	// Ready nodes with a Longhorn disk where its engine doesn't run, so no
+	// copies can be kept there (control planes without the toleration).
+	NoEngine []string
 
 	// Section errors, shown in the panels ("metrics-server not installed").
 	Errs map[string]string
@@ -256,6 +283,8 @@ var ccSlowPaths = []string{
 	"/api/v1/events?fieldSelector=" + url.QueryEscape("type=Warning"),
 	"/apis/longhorn.io/v1beta2/volumes",
 	"/apis/longhorn.io/v1beta2/nodes",
+	"/apis/longhorn.io/v1beta2/replicas",
+	"/apis/longhorn.io/v1beta2/engineimages",
 	"/api/v1/persistentvolumeclaims",
 	"/apis/apps/v1/deployments",
 	"/apis/apps/v1/statefulsets",
@@ -372,6 +401,7 @@ func (c *ccCollector) Collect() *ccSnapshot {
 		s.Apps, s.Events, s.Volumes, s.Disks = p.Apps, p.Events, p.Volumes, p.Disks
 		s.Workloads, s.Certs, s.Pools = p.Workloads, p.Certs, p.Pools
 		s.HasApps, s.HasLonghorn, s.HasCerts = p.HasApps, p.HasLonghorn, p.HasCerts
+		s.NoEngine = p.NoEngine
 		for _, k := range []string{"apps", "storage", "network", "events", "certs"} {
 			if e, ok := p.Errs[k]; ok {
 				s.Errs[k] = e
@@ -444,6 +474,12 @@ func (c *ccCollector) readSlow(s *ccSnapshot, got map[string]ccResult) {
 		s.Volumes = parseLonghornVolumes(r.data)
 		if r := got["/apis/longhorn.io/v1beta2/nodes"]; r.err == nil {
 			s.Disks = parseLonghornDisks(r.data)
+		}
+		if r := got["/apis/longhorn.io/v1beta2/replicas"]; r.err == nil {
+			applyLonghornReplicas(s.Volumes, r.data)
+		}
+		if r := got["/apis/longhorn.io/v1beta2/engineimages"]; r.err == nil {
+			s.NoEngine = longhornNoEngine(r.data, s.Disks, s.Nodes)
 		}
 	}
 	if r := got["/api/v1/persistentvolumeclaims"]; r.err == nil {
@@ -1136,6 +1172,64 @@ func parseLonghornDisks(data []byte) []ccDisk {
 	return out
 }
 
+// applyLonghornReplicas fills in which nodes hold each volume's copies.
+func applyLonghornReplicas(vols []ccVolume, data []byte) {
+	var list struct {
+		Items []struct {
+			Spec struct {
+				VolumeName string `json:"volumeName"`
+				NodeID     string `json:"nodeID"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	_ = json.Unmarshal(data, &list)
+	on := map[string][]string{}
+	for _, it := range list.Items {
+		if it.Spec.NodeID != "" {
+			on[it.Spec.VolumeName] = append(on[it.Spec.VolumeName], it.Spec.NodeID)
+		}
+	}
+	for i := range vols {
+		vols[i].Copies = on[vols[i].Name]
+	}
+}
+
+// longhornNoEngine: Ready nodes with a Longhorn disk where no engine image
+// is deployed (Longhorn keeps no copies there).
+func longhornNoEngine(data []byte, disks []ccDisk, nodes []ccNode) []string {
+	var list struct {
+		Items []struct {
+			Status struct {
+				State             string          `json:"state"`
+				NodeDeploymentMap map[string]bool `json:"nodeDeploymentMap"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if json.Unmarshal(data, &list) != nil || len(list.Items) == 0 {
+		return nil
+	}
+	ready := map[string]bool{}
+	for _, n := range nodes {
+		ready[n.Name] = n.Ready && !n.Unreachable
+	}
+	var out []string
+	for _, d := range disks {
+		if !ready[d.Node] {
+			continue
+		}
+		ok := false
+		for _, it := range list.Items {
+			if it.Status.State == "deployed" && it.Status.NodeDeploymentMap[d.Node] {
+				ok = true
+			}
+		}
+		if !ok {
+			out = append(out, d.Node)
+		}
+	}
+	return out
+}
+
 // mergePVCs adds claims Longhorn doesn't know (other storage classes) and
 // fills in claim names for Longhorn volumes.
 func mergePVCs(vols []ccVolume, data []byte) []ccVolume {
@@ -1452,6 +1546,16 @@ func buildAlerts(s *ccSnapshot) []ccAlert {
 			add(1, "Volume", v.NS, orDefault(v.PVC, v.Name), "Longhorn volume degraded (missing a replica)", time.Time{})
 		case !v.Longhorn && v.State == "pending":
 			add(1, "Volume", v.NS, v.PVC, "claim Pending", time.Time{})
+		}
+	}
+	if s.HasLonghorn {
+		for _, v := range s.Volumes {
+			if on, n := v.copiesOn(); v.Longhorn && v.Replicas > 1 && n == 1 && v.Robustness != "faulted" {
+				add(1, "Volume", v.NS, orDefault(v.PVC, v.Name), "all copies on "+on+": losing that node loses it (B in Storage spreads them)", time.Time{})
+			}
+		}
+		for _, n := range s.NoEngine {
+			add(1, "Node", "", n, "Longhorn can't keep volume copies here (B in Storage fixes it)", time.Time{})
 		}
 	}
 	for _, d := range s.Disks {

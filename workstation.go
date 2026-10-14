@@ -631,6 +631,7 @@ func (w *workstation) actions() map[string][]wsAction {
 			{title: "Cluster Configuration", desc: "config/cluster.yaml and the live kubeadm configuration", op: "config"},
 			{title: "Repair Control Plane Node", desc: "Restart containerd and kubelet on " + host, op: "repair", confirm: true},
 			{title: "Move Node to Dedicated Longhorn Disk", desc: "Format a spare disk and move a node's Longhorn data onto it", op: "longhorn-disk", confirm: true},
+			{title: "Spread Storage Across Nodes", desc: "Keep each volume's copies on different nodes and fail over when a node goes down (also B in the Command Center's Storage panel)", op: "longhorn-spread", confirm: true},
 			{title: "Import Docker Compose App", desc: "Deploy a docker-compose.yml from this computer into the cluster through GitOps", run: w.importCompose},
 			{title: "Change App Storage", desc: "Where an app keeps each folder: a Longhorn volume or a folder on a node's disk (also E in the Command Center's Storage panel)", op: "app-storage", confirm: true},
 			{title: "Remove Imported App", desc: "Remove an app imported from Docker Compose (and its data)", op: "compose-remove", confirm: true},
@@ -780,8 +781,12 @@ func (w *workstation) openCommandCenter() {
 		w.clusterNote.SetText("  [yellow]" + tview.Escape(err.Error()) + "[-]")
 		return
 	}
+	ccPage.onFiles = func(ns, pvc string) { w.openFilesAt(volumeLabel(ns, pvc)) }
 	ccPage.onStorage = func() {
 		w.runAction(wsAction{title: "Change App Storage", op: "app-storage"})
+	}
+	ccPage.onSpread = func() {
+		w.runAction(wsAction{title: "Spread Storage Across Nodes", op: "longhorn-spread"})
 	}
 	ccPage.Open(src, p.Name, w.showCluster)
 }

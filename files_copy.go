@@ -103,6 +103,8 @@ func (c *copyPlan) run(d *demoTerm) error {
 	switch {
 	case sDemo && dDemo:
 		return c.demoCopy(d, sm, dm)
+	case isVolume(c.src) || isVolume(c.dst):
+		return c.streamCopy(d)
 	case c.src.Local() && c.dst.Local():
 		return c.localToLocal(d)
 	case c.src.Local() && dSSH:
@@ -155,6 +157,8 @@ func progress(d *demoTerm, total int64, done func() int64, stop <-chan struct{})
 func (c *copyPlan) demoCopy(d *demoTerm, src, dst *memFS) error {
 	how := "tar over SSH"
 	switch {
+	case strings.HasPrefix(dst.label, "vol ") || strings.HasPrefix(src.label, "vol "):
+		how = "a tar stream through the volume's helper pod"
 	case src == dst:
 		how = "cp -a on " + src.label
 	case c.isNode != nil && c.isNode(src.label) && c.isNode(dst.label):
@@ -170,6 +174,16 @@ func (c *copyPlan) demoCopy(d *demoTerm, src, dst *memFS) error {
 	}
 	d.Print("\n")
 	dst.copyFrom(src, c.srcPaths(), c.dest)
+	if strings.HasPrefix(dst.label, "vol ") {
+		ns, _, _ := strings.Cut(strings.TrimPrefix(dst.label, "vol "), "/")
+		d.Print(cOK + "Owner set to 1000:1000 (the same as " + c.dest + "), so the app can use them.\n")
+		d.Printf("\ndeployment/%s uses this volume. Restart it now so it picks up the files? (y/N): ", ns)
+		if a, ok := d.ReadLine(true); ok && strings.HasPrefix(strings.ToLower(strings.TrimSpace(a)), "y") {
+			d.Print(cOK + "Restarted deployment/" + ns + ".\n")
+		} else {
+			d.Print("Not restarted. Later: kubectl -n " + ns + " rollout restart deployment/" + ns + "\n")
+		}
+	}
 	return nil
 }
 
@@ -235,7 +249,9 @@ func (c *copyPlan) nodeToLocal(d *demoTerm, src *sshFS) error {
 	var got atomic.Int64
 	stop := make(chan struct{})
 	go progress(d, total, got.Load, stop)
-	err = extractTar(localFS{}.real(c.dest), io.TeeReader(out, countingWriter{io.Discard, &got}))
+	in := io.TeeReader(out, countingWriter{io.Discard, &got})
+	err = extractTar(localFS{}.real(c.dest), in)
+	_, _ = io.Copy(io.Discard, in) // tar's padding after the end marker
 	werr := session.Wait()
 	close(stop)
 	time.Sleep(50 * time.Millisecond)
@@ -317,6 +333,163 @@ func (c *copyPlan) relay(d *demoTerm, a, b *sshFS) error {
 		if e.err != nil {
 			return fmt.Errorf("%v %s", e.err, strings.TrimSpace(e.msg))
 		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Into and out of Longhorn volumes: a tar stream from one end to the other
+// ---------------------------------------------------------------------------
+
+func isVolume(f fileSys) bool {
+	s, ok := f.(*sshFS)
+	return ok && s.vol != nil
+}
+
+// tarOut streams dir's names as tar from f.
+func tarOut(f fileSys, dir string, names []string) (io.Reader, func() error, error) {
+	switch fs := f.(type) {
+	case localFS:
+		var real []string
+		for _, n := range names {
+			real = append(real, fs.real(path.Join(dir, n)))
+		}
+		pr, pw := io.Pipe()
+		errc := make(chan error, 1)
+		go func() {
+			_, _, err := writeTar(pw, real, new(atomic.Int64))
+			pw.CloseWithError(err)
+			errc <- err
+		}()
+		return pr, func() error { return <-errc }, nil
+	case *sshFS:
+		cmd := "tar -c -C " + shellQuote(dir) + " -- " + quoteAll(names)
+		if fs.vol != nil {
+			pr, pw := io.Pipe()
+			errc := make(chan error, 1)
+			go func() {
+				err := fs.stream(volExec(fs)+cmd, nil, pw)
+				pw.CloseWithError(err)
+				errc <- err
+			}()
+			return pr, func() error { return <-errc }, nil
+		}
+		if fs.sudo == 1 {
+			cmd = "sudo -n " + cmd
+		}
+		session, err := fs.client.NewSession()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, _ := session.StdoutPipe()
+		var stderr strings.Builder
+		session.Stderr = &stderr
+		if err := session.Start(cmd); err != nil {
+			session.Close()
+			return nil, nil, err
+		}
+		return out, func() error {
+			defer session.Close()
+			if err := session.Wait(); err != nil {
+				return fmt.Errorf("%v %s", err, strings.TrimSpace(stderr.String()))
+			}
+			return nil
+		}, nil
+	}
+	return nil, nil, errors.New("can't read from " + f.Label())
+}
+
+// tarIn unpacks a tar stream into dest on f.
+func tarIn(f fileSys, dest string) (io.WriteCloser, func() error, error) {
+	switch fs := f.(type) {
+	case localFS:
+		pr, pw := io.Pipe()
+		errc := make(chan error, 1)
+		go func() {
+			err := extractTar(fs.real(dest), pr)
+			if err == nil {
+				_, _ = io.Copy(io.Discard, pr) // tar pads its stream past the end marker
+			}
+			pr.CloseWithError(err)
+			errc <- err
+		}()
+		return pw, func() error { return <-errc }, nil
+	case *sshFS:
+		cmd := "mkdir -p -- " + shellQuote(dest) + " && tar -x -C " + shellQuote(dest)
+		if fs.vol != nil {
+			pr, pw := io.Pipe()
+			errc := make(chan error, 1)
+			go func() {
+				err := fs.stream(volExec(fs)+"sh -c "+shellQuote(cmd), pr, io.Discard)
+				pr.CloseWithError(err)
+				errc <- err
+			}()
+			return pw, func() error { return <-errc }, nil
+		}
+		if fs.sudo == 1 {
+			cmd = "sudo -n sh -c " + shellQuote(cmd)
+		}
+		session, err := fs.client.NewSession()
+		if err != nil {
+			return nil, nil, err
+		}
+		in, _ := session.StdinPipe()
+		var stderr strings.Builder
+		session.Stderr = &stderr
+		if err := session.Start(cmd); err != nil {
+			session.Close()
+			return nil, nil, err
+		}
+		return in, func() error {
+			defer session.Close()
+			if err := session.Wait(); err != nil {
+				return fmt.Errorf("%v %s", err, strings.TrimSpace(stderr.String()))
+			}
+			return nil
+		}, nil
+	}
+	return nil, nil, errors.New("can't write to " + f.Label())
+}
+
+// streamCopy copies with a tar stream from the source to the destination
+// (used when one end is a Longhorn volume). Files copied into a volume
+// get the owner of the folder they land in, so the app can use them.
+func (c *copyPlan) streamCopy(d *demoTerm) error {
+	via := ""
+	if isVolume(c.dst) || isVolume(c.src) {
+		via = " (through the volume's helper pod)"
+	}
+	d.Print(cInfo + "Streaming " + c.src.Label() + " → " + c.dst.Label() + via + "\n")
+	total, _ := c.src.DiskUsage(c.srcPaths())
+	r, waitOut, err := tarOut(c.src, c.srcDir, c.names)
+	if err != nil {
+		return err
+	}
+	w, waitIn, err := tarIn(c.dst, c.dest)
+	if err != nil {
+		return err
+	}
+	var sent atomic.Int64
+	stop := make(chan struct{})
+	go progress(d, total, sent.Load, stop)
+	_, cerr := io.Copy(countingWriter{w, &sent}, r)
+	w.Close()
+	errOut, errIn := waitOut(), waitIn()
+	close(stop)
+	time.Sleep(50 * time.Millisecond)
+	for _, e := range []error{errIn, errOut, cerr} {
+		if e != nil {
+			return e
+		}
+	}
+	if dst, ok := c.dst.(*sshFS); ok && dst.vol != nil {
+		out, err := dst.run("o=$(stat -c %u:%g " + shellQuote(c.dest) + ") && chown -R \"$o\" -- " + quoteAll(c.dstPaths()) + " && echo \"$o\"")
+		if err == nil {
+			d.Print(cOK + "Owner set to " + strings.TrimSpace(out) + " (the same as " + c.dest + "), so the app can use them.\n")
+		} else {
+			d.Print(cWarn + "Couldn't set the owner: " + err.Error() + "\n")
+		}
+		restartUsers(d, c.kube, dst.vol)
 	}
 	return nil
 }

@@ -107,6 +107,14 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Spread Storage Across Nodes",
+		Desc:  "Shows which nodes hold each Longhorn volume's copies, then makes Longhorn keep one copy per node (also on the control planes), move copies off crowded nodes, and start a down node's apps on another node with their volumes. Asks first; the apps using volumes stop for a minute or two if Longhorn has to be allowed on the control planes. Also: B in the Command Center's Storage panel.",
+		Op:    "longhorn-spread",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run longhorn-spread",
+		},
+	},
+	{
 		Title: "Import Docker Compose App",
 		Desc:  "Turn a docker-compose.yml into an app in your GitOps repo (apps/applications/<name>): web UIs get https://<name>.<domain>, LAN services a MetalLB IP, volumes go on Longhorn and passwords into a cluster Secret. Then it deploys and waits until it's healthy.",
 		Op:    "compose-import",
@@ -2261,11 +2269,21 @@ func main() {
 		return ""
 	}
 	openCC = func() { ccPage.Open(nodeCCSource(), cluster.Name, backToMain) }
-	openFiles = func() { openNodeFiles(app, pages, footer, activity.last, backToMain) }
+	openFiles = func() { openNodeFiles(app, pages, footer, activity.last, "", backToMain) }
+	ccPage.onFiles = func(ns, pvc string) {
+		openNodeFiles(app, pages, footer, activity.last, volumeLabel(ns, pvc), backToMain)
+	}
 	ccPage.onStorage = func() {
 		for _, op := range operations {
 			if op.Op == "app-storage" {
 				showDetail(op) // same as picking it in the menu (dry-run applies)
+			}
+		}
+	}
+	ccPage.onSpread = func() {
+		for _, op := range operations {
+			if op.Op == "longhorn-spread" {
+				showDetail(op)
 			}
 		}
 	}

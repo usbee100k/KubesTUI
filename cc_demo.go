@@ -350,6 +350,18 @@ func (d *demoCCSource) get(path string) (any, error) {
 			vol("pvc-5e6f", "n8n", "n8n-data", "cp3", "healthy", 5, 0.4),
 			vol("pvc-8a9b", "argocd", "redis-data", "cp1", "healthy", 1, 0.1),
 		}}, nil
+	case path == "/apis/longhorn.io/v1beta2/replicas":
+		var items []obj2
+		for vol, nodes := range map[string][]string{"pvc-1a2b": {"w1", "cp1"}, "pvc-3c4d": {"w1", "w1"},
+			"pvc-7f3a": {"w1", "w2"}, "pvc-5e6f": {"cp1", "w1"}, "pvc-8a9b": {"cp1", "w1"}} {
+			for _, n := range nodes {
+				items = append(items, obj2{"spec": obj2{"volumeName": vol, "nodeID": n}})
+			}
+		}
+		return obj2{"items": items}, nil
+	case path == "/apis/longhorn.io/v1beta2/engineimages":
+		return obj2{"items": []obj2{{"status": obj2{"state": "deployed",
+			"nodeDeploymentMap": obj2{"cp1": true, "cp2": false, "cp3": false, "w1": true, "w2": true}}}}}, nil
 	case path == "/apis/longhorn.io/v1beta2/nodes":
 		var items []obj2
 		for _, n := range demoCCNodes {

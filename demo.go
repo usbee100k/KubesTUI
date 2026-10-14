@@ -238,6 +238,8 @@ func demoScriptFor(op string) func(d *demoTerm) int {
 		return demoOSUpdate
 	case "app-storage":
 		return demoAppStorage
+	case "longhorn-spread":
+		return demoLonghornSpread
 	}
 	return func(d *demoTerm) int {
 		d.Print("demo: no simulation for " + op + "\n")
@@ -891,6 +893,100 @@ func demoRebootMenu(d *demoTerm, need []string) int {
 		}
 		d.Print(cGreen + "[ OK ]" + cReset + " " + name + " rebooted and is Ready.\n")
 	}
+	return 0
+}
+
+// demoLonghornSpread mirrors homelabCD's spread_longhorn_storage
+// (lib/longhorn-spread.sh).
+func demoLonghornSpread(d *demoTerm) int {
+	if !demoSudo(d) {
+		return d.exitCode()
+	}
+	warn := func(s string) string { return "  " + cYellow + "← " + s + cReset }
+	table := func(spread bool) []string {
+		cps := "can't keep copies (control-plane taint)"
+		copies := [2]string{"0", "0"}
+		data, redis := "w1×2 (2 wanted)"+warn("all on one node"), "cp1 w1 (2 wanted)"
+		if spread {
+			cps, copies, data = "keeps copies", [2]string{"1", "0"}, "cp2 w1 (2 wanted)"
+		}
+		return []string{
+			"", "Nodes:",
+			"  NODE           STATE     LONGHORN                                     COPIES  SPACE (reserved of usable)",
+			"  cp1            Ready     keeps copies                                 3       12.0G of 140.0G",
+			"  cp2            Ready     " + fmt.Sprintf("%-45s%-8s", cps, copies[0]) + "0.0G of 140.0G",
+			"  cp3            Ready     " + fmt.Sprintf("%-45s%-8s", cps, copies[1]) + "0.0G of 140.0G",
+			"  w1             Ready     keeps copies                                 5       121.0G of 630.0G",
+			"  w2             NotReady  down: copies there are unavailable           1       10.0G of 630.0G",
+			"", "Volumes:",
+			"  VOLUME                                   HEALTH     COPIES ON",
+			"  argocd/redis-data                        healthy    " + redis,
+			"  jellyfin/jellyfin-config                 healthy    cp1 w1 (2 wanted)",
+			"  n8n/n8n-data                             healthy    cp1 w1 (2 wanted)",
+			"  nextcloud/data                           healthy    " + data,
+			"  nextcloud/db                             degraded   w1 w2 (2 wanted)",
+		}
+	}
+	d.Print("\n=============================================\n Spread Storage Across Nodes\n=============================================\n")
+	if !d.Lines(40*time.Millisecond, table(false)...) {
+		return d.exitCode()
+	}
+	d.Lines(60*time.Millisecond,
+		"",
+		cYellow+"[WARN]"+cReset+" Down: w2. Longhorn can't use their copies or keep new ones there until they're back.",
+		"",
+		"This will:",
+		"  - Let Longhorn keep copies on cp2 cp3 (taint-toleration).",
+		"    Longhorn restarts its parts for this, which it only does while no volume is",
+		"    in use: the apps using volumes are stopped for a minute or two, then started.",
+		"    Stopped meanwhile: argocd/argocd-redis, jellyfin/jellyfin, n8n/n8n, nextcloud/nextcloud, nextcloud/nextcloud-db",
+		"  - One copy per node, never two copies on the same node (replica-soft-anti-affinity=false).",
+		"  - Move extra copies from crowded nodes to nodes without one (replica-auto-balance=best-effort).",
+		"  - When a node goes down, its apps start on another node with their volumes (node-down-pod-deletion-policy=delete-both-statefulset-and-deployment-pod).",
+		"  Longhorn then builds copies on the other nodes in the background; each old copy",
+		"  is removed only after its new one is ready. Your data isn't touched.",
+		"",
+	)
+	d.Print("Go ahead? (y/N): ")
+	a, ok := d.ReadLine(true)
+	if !ok {
+		return d.exitCode()
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(a)), "y") {
+		d.Print("Nothing changed.\n")
+		return 0
+	}
+	apps := []string{"argocd/argocd-redis", "jellyfin/jellyfin", "n8n/n8n", "nextcloud/nextcloud", "nextcloud/nextcloud-db"}
+	lines := []string{"", cBlue + "[INFO]" + cReset + " Stopping the apps that use volumes (Argo CD paused for them)..."}
+	for _, app := range apps {
+		lines = append(lines, "  stopped "+app)
+	}
+	if !d.Lines(120*time.Millisecond, lines...) {
+		return d.exitCode()
+	}
+	if !d.Lines(900*time.Millisecond,
+		"  waiting for 5 volume(s) to be released...",
+		"  waiting for 2 volume(s) to be released...",
+		cGreen+"[ OK ]"+cReset+" Longhorn now runs on the control planes too (taint-toleration).",
+		"  waiting for Longhorn to start on cp2 cp3...",
+		cGreen+"[ OK ]"+cReset+" Longhorn's engine runs on every Ready node.",
+	) {
+		return d.exitCode()
+	}
+	lines = []string{"", cBlue + "[INFO]" + cReset + " Starting the apps again..."}
+	for _, app := range apps {
+		lines = append(lines, cGreen+"[ OK ]"+cReset+" Started "+app+".")
+	}
+	lines = append(lines, cGreen+"[ OK ]"+cReset+" All the apps are running again.", "",
+		cGreen+"[ OK ]"+cReset+" replica-soft-anti-affinity = false",
+		cGreen+"[ OK ]"+cReset+" replica-auto-balance = best-effort",
+		cGreen+"[ OK ]"+cReset+" node-down-pod-deletion-policy = delete-both-statefulset-and-deployment-pod",
+		"", cBlue+"[INFO]"+cReset+" Where the copies are now (Longhorn keeps moving them in the background):")
+	if !d.Lines(250*time.Millisecond, lines...) || !d.Sleep(1500*time.Millisecond) {
+		return d.exitCode()
+	}
+	d.Lines(40*time.Millisecond, append(table(true), "",
+		"  Watch it in the Command Center's Storage panel (7): the COPIES column, or run this again.")...)
 	return 0
 }
 

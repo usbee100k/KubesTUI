@@ -230,7 +230,7 @@ func opSection(op string) string {
 
 // clusterOrder puts the Cluster section's operations in a sensible order
 // (checks first, then changes).
-var clusterOrder = []string{"health", "config", "rename", "repair", "longhorn-disk", "compose-import", "app-storage", "compose-remove"}
+var clusterOrder = []string{"health", "config", "rename", "repair", "longhorn-disk", "longhorn-spread", "compose-import", "app-storage", "compose-remove"}
 
 func clusterRank(op string) int {
 	for i, o := range clusterOrder {

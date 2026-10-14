@@ -122,6 +122,13 @@ type commandCenter struct {
 	// onStorage opens "Change App Storage" (E in the Storage panel);
 	// nil hides it.
 	onStorage func()
+
+	// onFiles opens Files on a Longhorn volume (F in the Storage panel).
+	onFiles func(ns, pvc string)
+
+	// onSpread opens "Spread Storage Across Nodes" (B in the Storage
+	// panel); nil hides it.
+	onSpread func()
 }
 
 var ccPage *commandCenter
@@ -444,9 +451,17 @@ func (c *commandCenter) titleInfo(p ccPanelID) string {
 	case pNamespaces:
 		return "[gray]sort[-] " + nsSorts[c.nsSort]
 	case pStorage:
-		if c.onStorage != nil {
-			return "[aqua::b]E[-::-] [gray]change app storage[-]"
+		hints := []string{}
+		if c.onFiles != nil {
+			hints = append(hints, "[aqua::b]F[-::-] [gray]files in the volume[-]")
 		}
+		if c.onStorage != nil {
+			hints = append(hints, "[aqua::b]E[-::-] [gray]change app storage[-]")
+		}
+		if c.onSpread != nil {
+			hints = append(hints, "[aqua::b]B[-::-] [gray]spread copies[-]")
+		}
+		return strings.Join(hints, "  ")
 	case pNodes:
 		if s != nil && s.Version != "" {
 			return "[gray]sort[-] " + nodeSorts[c.nodeSort]
@@ -1179,6 +1194,7 @@ func (c *commandCenter) storageTable(width int) *ccTable {
 			{title: "USED", width: 6, right: true, drop: 3},
 			{title: "STATE", width: 9},
 			{title: "NODE", width: 7, drop: 4},
+			{title: "COPIES", width: 14, drop: 2},
 		},
 		empty: "no volumes",
 	}
@@ -1208,9 +1224,21 @@ func (c *commandCenter) storageTable(width int) *ccTable {
 		if v.Actual > 0 {
 			used = fmtBytes(v.Actual)
 		}
+		copies, copyCol := "-", "gray"
+		if v.Longhorn && s.HasLonghorn {
+			on, n := v.copiesOn()
+			copies = orDefault(on, "none")
+			switch {
+			case n == 0:
+				copyCol = "red"
+			case n == 1 && v.Replicas > 1:
+				copyCol = "yellow" // one node going down takes the volume with it
+			}
+		}
 		t.rows = append(t.rows, ccRow{key: "vol/" + v.Name + "/" + claim, cells: []ccCell{
 			{text: "●", color: volColor(v)}, {text: claim}, {text: fmtBytes(v.Size)}, {text: used, color: "gray"},
 			{text: state, color: volColor(v)}, {text: orDefault(v.Node, "-"), color: "gray"},
+			{text: copies, color: copyCol},
 		}})
 	}
 	return t
@@ -1574,6 +1602,16 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			}
 		case r == 'r' || r == 'R':
 			c.reverse = !c.reverse
+		case (r == 'f' || r == 'F') && c.focus == pStorage && c.onFiles != nil:
+			// key: vol/<pv>/<ns>/<claim>
+			// No row shown (a short window): Files opens on the first volume.
+			ns, pvc := "", ""
+			if parts := strings.SplitN(c.selected(pStorage), "/", 4); len(parts) == 4 && parts[0] == "vol" {
+				ns, pvc = parts[2], parts[3]
+			}
+			open := c.onFiles
+			c.Close()
+			open(ns, pvc)
 		case r == 'z' || r == 'Z' || r == 'f' || r == 'F':
 			c.zoom = !c.zoom
 		case r == 'p' || r == 'P' || r == ' ':
@@ -1608,6 +1646,12 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 		case r == 'e' || r == 'E':
 			if c.focus == pStorage && c.onStorage != nil {
 				open := c.onStorage
+				c.Close()
+				open()
+			}
+		case r == 'b' || r == 'B':
+			if c.focus == pStorage && c.onSpread != nil {
+				open := c.onSpread
 				c.Close()
 				open()
 			}
@@ -2013,9 +2057,17 @@ func (c *commandCenter) volumeDetail(key string, w int) []string {
 			kv("STATE", fmt.Sprintf("[%s]%s[-]", volColor(v), tview.Escape(strings.TrimSpace(v.State+" "+v.Robustness)))),
 		}
 		if v.Longhorn {
-			l = append(l, kv("ATTACHED TO", orDefault(v.Node, "-")), kv("REPLICAS", fmt.Sprint(v.Replicas)))
+			on, n := v.copiesOn()
+			l = append(l, kv("ATTACHED TO", orDefault(v.Node, "-")+"   [gray](the node running its app)[-]"),
+				kv("REPLICAS", fmt.Sprintf("%d wanted   [gray]copies on[-] %s", v.Replicas, tview.Escape(orDefault(on, "none")))))
 			if v.Robustness == "degraded" {
 				l = append(l, "", "[yellow]Degraded: a replica is missing (often its node is down). Longhorn rebuilds it when the node is back or on another node with space.[-]")
+			}
+			if v.Replicas > 1 && n <= 1 {
+				l = append(l, "")
+				for _, line := range wrapText("Every copy is on one node (or none exists): if that node goes down, so does the volume. B in the Storage panel spreads the copies across the nodes.", w) {
+					l = append(l, "[yellow]"+line+"[-]")
+				}
 			}
 		}
 		return l
