@@ -62,7 +62,7 @@ func splitDropped(s string) []string {
 			} else {
 				p, s = s[1:end+1], s[end+2:]
 			}
-		case fileExists(s):
+		case fileExists(s) || fileExists(localPath(s)):
 			p, s = s, "" // one unquoted path that contains spaces
 		default:
 			end := strings.IndexAny(s, " \t")
@@ -537,7 +537,7 @@ func (w *workstation) transferFiles() {
 	form.AddInputField("SSH user", userFor(nodes[0]), 24, nil, nil)
 	form.AddInputField("Folder on the node", homeOf(userFor(nodes[0])), 52, nil, nil)
 	form.GetFormItemByLabel("File or folder").(*tview.InputField).
-		SetPlaceholder("Type a location or drop here…").
+		SetPlaceholder("Type a location, drop here, or Browse below…").
 		SetPlaceholderTextColor(tcell.ColorGray)
 
 	// Keep the default folder in step with the user until it's edited.
@@ -561,14 +561,47 @@ func (w *workstation) transferFiles() {
 		w.pages.RemovePage("transferform")
 		w.showCluster()
 	}
+	fileField := form.GetFormItemByLabel("File or folder").(*tview.InputField)
+
+	// Browse: the Windows file dialog, for terminals that refuse drops
+	// (e.g. one running as administrator).
+	if pickerAvailable() {
+		browse := func(folder bool) {
+			errText.SetText("  [aqua]Opening the Windows file picker (it may open behind this window)…[-]")
+			go func() {
+				paths, err := pickPaths(folder)
+				w.app.QueueUpdateDraw(func() {
+					switch {
+					case err != nil:
+						errText.SetText("  [red]File picker: " + tview.Escape(err.Error()) + "[-]")
+					case len(paths) == 0:
+						errText.SetText("")
+					default:
+						text := strings.TrimSpace(fileField.GetText())
+						if text != "" {
+							text += " "
+						}
+						fileField.SetText(text + quotePaths(paths))
+						errText.SetText("")
+					}
+				})
+			}()
+		}
+		form.AddButton("Browse files…", func() { browse(false) })
+		form.AddButton("Browse folder…", func() { browse(true) })
+	}
+
 	form.AddButton("Transfer", func() {
-		paths := splitDropped(form.GetFormItemByLabel("File or folder").(*tview.InputField).GetText())
+		paths := splitDropped(fileField.GetText())
+		for i := range paths {
+			paths[i] = localPath(paths[i]) // C:\... typed into the WSL version
+		}
 		i, _ := form.GetFormItemByLabel("Node").(*tview.DropDown).GetCurrentOption()
 		user := strings.TrimSpace(form.GetFormItemByLabel("SSH user").(*tview.InputField).GetText())
 		dest := strings.TrimSpace(destField.GetText())
 		switch {
 		case len(paths) == 0:
-			errText.SetText("  [red]Drop a file or folder into the first box (or paste its path).[-]")
+			errText.SetText("  [red]Choose a file or folder: drop it in the first box, use Browse, or type its path.[-]")
 			return
 		case user == "":
 			errText.SetText("  [red]Enter the SSH user.[-]")
@@ -606,9 +639,12 @@ func (w *workstation) transferFiles() {
 	styleForm(form)
 	form.SetBorder(false)
 
-	hint := `Drag them from Explorer into the box, or paste a path (C:\Users\me\Videos)`
-	if runtime.GOOS != "windows" {
-		hint = "Drag them into the box, or type a path (~/Videos)"
+	hint := `Drop into the box, use Browse, or type a path like C:\Users\me\Videos`
+	switch {
+	case inWSL():
+		hint = `Drop into the box, use Browse, or type a path (C:\... works too)`
+	case runtime.GOOS != "windows":
+		hint = "Drop into the box, or type a path like ~/Videos"
 	}
 	panel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(tview.NewTextView().SetDynamicColors(true).SetText(
