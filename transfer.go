@@ -459,33 +459,34 @@ func demoTransfer(job transferJob) func(d *demoTerm) int {
 // The form
 // ---------------------------------------------------------------------------
 
-func (w *workstation) transferFiles() {
+// nodeChoices lists the cluster's nodes for a form: the entries (SSH user
+// filled in), drop-down labels with a green/red status light, and whether
+// each is Ready.
+func (w *workstation) nodeChoices() (nodes []hostEntry, labels []string, ready []bool) {
 	p := w.current
-
 	// Nodes: the cluster's nodes, else the control plane this cluster is
 	// paired with.
 	rows := w.nodeCache
 	if len(rows) == 0 && w.activity != nil {
 		rows = w.activity.last // the node lights' latest poll
 	}
-	var nodes []hostEntry
-	var ready []string // "Ready" / "NotReady" / "" (unknown)
+	var status []string // "Ready" / "NotReady" / "" (unknown)
 	for _, r := range rows {
 		host := r.host
 		if host == "" {
 			host = r.name
 		}
 		nodes = append(nodes, hostEntry{Name: r.name, Host: host, User: p.User, Port: 22})
-		ready = append(ready, r.status)
+		status = append(status, r.status)
 	}
 	if len(nodes) == 0 {
 		nodes = append(nodes, hostEntry{Name: p.Host, Host: p.Host, User: p.User, Port: p.port()})
-		ready = append(ready, "")
+		status = append(status, "")
 	}
-	labels := make([]string, len(nodes))
+	labels = make([]string, len(nodes))
 	for i, n := range nodes {
 		light := "[gray]●[-]"
-		switch ready[i] {
+		switch status[i] {
 		case "Ready":
 			light = "[green]●[-]"
 		case "":
@@ -496,7 +497,7 @@ func (w *workstation) transferFiles() {
 		if n.Host != n.Name {
 			labels[i] += "  (" + n.Host + ")"
 		}
-		if ready[i] != "" && ready[i] != "Ready" {
+		if status[i] != "" && status[i] != "Ready" {
 			labels[i] += "  [red]off[-]"
 		}
 	}
@@ -522,6 +523,18 @@ func (w *workstation) transferFiles() {
 		}
 		return p.User
 	}
+
+	for i := range nodes {
+		nodes[i].User = userFor(nodes[i])
+		ready = append(ready, status[i] != "NotReady")
+	}
+	return nodes, labels, ready
+}
+
+func (w *workstation) transferFiles() {
+	p := w.current
+	nodes, labels, _ := w.nodeChoices()
+	userFor := func(n hostEntry) string { return n.User }
 
 	homeOf := func(user string) string {
 		if user == "root" {

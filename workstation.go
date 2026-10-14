@@ -623,6 +623,7 @@ func (w *workstation) actions() map[string][]wsAction {
 			{title: "Open Shell on Control Plane", desc: "A terminal on " + host, run: w.openShell},
 			{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
 			{title: "Open k9s", desc: "Browse pods, logs and events in k9s on this computer (downloads it the first time)", run: w.openK9s},
+			{title: "Files", desc: "Two-pane file manager across this computer and every node: browse, preview, copy/move (node to node directly), rename, delete", run: w.openFiles},
 			{title: "Transfer Files to a Node", desc: "Drop files or folders from this computer and copy them to any node over SSH (default /home/<user>/)", run: w.transferFiles},
 		},
 		secCluster: {

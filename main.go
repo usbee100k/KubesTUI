@@ -2168,7 +2168,8 @@ func main() {
 		app.SetFocus(detail)
 	}
 
-	var openCC func()
+	var openCC, openFiles func()
+	var activity *activityPanel // the header's node lights (set below)
 	toggle := func() {
 		dryRun = !dryRun
 		info.SetText(infoText())
@@ -2177,6 +2178,7 @@ func main() {
 		secCommandCenter: {
 			{title: "Command Center", run: func() { openCC() }},
 			{title: "SSH Console", run: func() { sshPage.Show() }},
+			{title: "Files", run: func() { openFiles() }},
 			{title: "Share KubesTUI with a Workstation", run: func() { sharer.Start() }},
 		},
 	}
@@ -2207,7 +2209,7 @@ func main() {
 	})
 
 	// Header: cluster info on the left, live node lights on the right.
-	activity := newActivityPanel(app)
+	activity = newActivityPanel(app)
 	top := tview.NewFlex().
 		AddItem(info, 36, 0, false).
 		AddItem(activity.view, 0, 1, false)
@@ -2259,6 +2261,7 @@ func main() {
 		return ""
 	}
 	openCC = func() { ccPage.Open(nodeCCSource(), cluster.Name, backToMain) }
+	openFiles = func() { openNodeFiles(app, pages, footer, activity.last, backToMain) }
 	ccPage.onStorage = func() {
 		for _, op := range operations {
 			if op.Op == "app-storage" {

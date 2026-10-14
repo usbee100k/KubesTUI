@@ -7,10 +7,16 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/gdamore/tcell/v2"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,14 +83,106 @@ func (w *workstation) importCompose() {
 		return
 	}
 
+	// Where the compose file is: this computer, or one of the nodes (then
+	// its data folders can come along into the new volumes).
+	nodes, labels, ready := w.nodeChoices()
+	sources := append([]string{"This computer"}, labels...)
+
 	errText := tview.NewTextView().SetDynamicColors(true)
-	form := tview.NewForm().AddInputField("Compose file or folder", "", 52, nil, nil)
+	form := tview.NewForm()
+	form.AddDropDown("Compose file on", sources, 0, nil)
+	form.AddInputField("Compose file or folder", "", 52, nil, nil)
+	sourceDD := form.GetFormItemByLabel("Compose file on").(*tview.DropDown)
+	fileField := form.GetFormItemByLabel("Compose file or folder").(*tview.InputField)
+	fileField.SetPlaceholderTextColor(tcell.ColorGray)
+	node := func() int { i, _ := sourceDD.GetCurrentOption(); return i - 1 } // -1: this computer
+	setPlaceholder := func() {
+		if n := node(); n >= 0 {
+			fileField.SetPlaceholder("Path on " + nodes[n].Name + ", or Browse to find it…")
+		} else {
+			fileField.SetPlaceholder("Type a path, drop it here, or Browse…")
+		}
+	}
+	sourceDD.SetSelectedFunc(func(string, int) { fileField.SetText(""); setPlaceholder() })
+	setPlaceholder()
+
+	showForm := func() {
+		w.pages.SwitchToPage("cluster")
+		w.pages.ShowPage("composeform")
+		w.footer.SetText(" [aqua::b]TAB[-::-] Next field    [aqua::b]ENTER[-::-] Select    [aqua::b]ESC[-::-] Cancel")
+		w.app.SetFocus(form)
+	}
 	closeForm := func() {
 		w.pages.RemovePage("composeform")
 		w.showCluster()
 	}
+
+	form.AddButton("Browse…", func() {
+		n := node()
+		if n < 0 {
+			if !pickerAvailable() {
+				errText.SetText("  [yellow]No file picker here: type the path.[-]")
+				return
+			}
+			errText.SetText("  [aqua]Opening the Windows file picker (it may open behind this window)…[-]")
+			go func() {
+				paths, err := pickPaths(false)
+				w.app.QueueUpdateDraw(func() {
+					errText.SetText("")
+					if err != nil {
+						errText.SetText("  [red]File picker: " + tview.Escape(err.Error()) + "[-]")
+					} else if len(paths) > 0 {
+						fileField.SetText(paths[0])
+					}
+				})
+			}()
+			return
+		}
+		target := nodes[n]
+		if !ready[n] {
+			errText.SetText("  [red]" + tview.Escape(target.Name) + " is off; choose a node that's on.[-]")
+			return
+		}
+		errText.SetText("  [aqua]Connecting to " + tview.Escape(target.Name) + "…[-]")
+		go func() {
+			var fs nodeFS = demoFS{}
+			var err error
+			if !p.demo {
+				fs, err = openSSHFS(target, []string{p.keyPath()})
+			}
+			w.app.QueueUpdateDraw(func() {
+				if err != nil {
+					errText.SetText("  [red]" + tview.Escape(err.Error()) + "[-]")
+					return
+				}
+				errText.SetText("")
+				start := strings.TrimSpace(fileField.GetText())
+				if start != "" && !strings.HasSuffix(start, "/") {
+					start = path.Dir(start)
+				}
+				openNodeBrowser(w.app, w.pages, w.footer,
+					fmt.Sprintf("BROWSE  %s@%s  ·  pick the compose file (or ^P its folder)", target.User, target.Name),
+					fs, start,
+					func(picked string, _ bool) { fileField.SetText(picked); showForm() },
+					showForm)
+			})
+		}()
+	})
 	form.AddButton("Import", func() {
-		file, err := findComposeFile(form.GetFormItem(0).(*tview.InputField).GetText())
+		text := strings.TrimSpace(fileField.GetText())
+		if n := node(); n >= 0 {
+			switch {
+			case !ready[n]:
+				errText.SetText("  [red]" + tview.Escape(nodes[n].Name) + " is off; choose a node that's on.[-]")
+			case !strings.HasPrefix(text, "/"):
+				errText.SetText("  [red]Enter the full path on " + tview.Escape(nodes[n].Name) + " (or use Browse).[-]")
+			default:
+				w.pages.RemovePage("composeform")
+				w.launchComposeImport(text, &nodes[n])
+			}
+			return
+		}
+		file, err := findComposeFile(localPath(text))
 		if err == nil && !p.demo {
 			_, _, err = composeBundle(file) // validates the compose file here first
 		}
@@ -93,35 +191,154 @@ func (w *workstation) importCompose() {
 			return
 		}
 		w.pages.RemovePage("composeform")
-		w.launchComposeImport(file)
+		w.launchComposeImport(file, nil)
 	})
 	form.AddButton("Cancel", closeForm)
 	form.SetCancelFunc(closeForm)
 	styleForm(form)
 	form.SetBorder(false)
 
-	hint := `e.g. C:\docker\jellyfin   or   C:\docker\jellyfin\docker-compose.yml`
-	if runtime.GOOS != "windows" {
-		hint = "e.g. ~/docker/jellyfin   or   ~/docker/jellyfin/docker-compose.yml"
-	}
 	panel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(tview.NewTextView().SetDynamicColors(true).SetText(
 			"\n  [yellow::b]Import a Docker Compose app[-::-]\n"+
-				"  The compose file, its .env and small files it mounts are uploaded to\n"+
-				"  "+tview.Escape(p.Host)+" for the import, then deleted there. Folders it mounts\n"+
-				"  become new Longhorn volumes (copy data over afterwards if needed).\n"+
-				"  [gray]"+tview.Escape(hint)+"[-]"), 7, 0, false).
+				"  The compose file, its .env and small files it mounts go to "+tview.Escape(p.Host)+"\n"+
+				"  for the import. Folders it mounts become Longhorn volumes; when the\n"+
+				"  compose file is on a node, their data can be copied in (configs: ~1Gi).\n"+
+				"  [gray]Browse a node to search its folders, or Ctrl+F to find compose files.[-]"), 7, 0, false).
 		AddItem(form, 0, 1, true).
 		AddItem(errText, 1, 0, false)
 	panel.SetBorder(true).SetTitle(" DOCKER COMPOSE ").SetTitleAlign(tview.AlignLeft)
-	w.pages.AddPage("composeform", centered(panel, 80, 17), true, true)
-	w.footer.SetText(" [aqua::b]ENTER[-::-] Import    [aqua::b]ESC[-::-] Cancel")
+	w.pages.AddPage("composeform", centered(panel, 84, 19), true, true)
+	w.footer.SetText(" [aqua::b]TAB[-::-] Next field    [aqua::b]ENTER[-::-] Select    [aqua::b]ESC[-::-] Cancel")
 	w.app.SetFocus(form)
 }
 
-func (w *workstation) launchComposeImport(file string) {
+// fetchComposeFromNode copies a compose file from a node, with the small
+// files next to it (.env, config files it may mount), into a temporary
+// folder here. Data folders stay on the node. Returns the local compose
+// file and its folder on the node.
+func fetchComposeFromNode(node hostEntry, keys []string, remote string) (local, remoteDir string, sizes map[string]int64, cleanup func(), err error) {
+	fs, err := openSSHFS(node, keys)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	defer fs.Close()
+
+	// A folder: the compose file in it.
+	out, err := fs.run(`p=` + shellQuote(remote) + `; if [ -d "$p" ]; then for n in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do [ -f "$p/$n" ] && { echo "$p/$n"; exit 0; }; done; echo "no compose file in $p" >&2; exit 1; fi; [ -f "$p" ] && echo "$p"`)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	file := strings.TrimSpace(out)
+	if file == "" {
+		return "", "", nil, nil, fmt.Errorf("%s not found on %s", remote, node.Name)
+	}
+	remoteDir = path.Dir(file)
+
+	// Small files up to two levels down (configs, .env), not the data.
+	tarData, err := fs.run("cd " + shellQuote(remoteDir) + " && find . -maxdepth 2 -type f -size -513k -print0 2>/dev/null | head -z -n 300 | tar --null --ignore-failed-read -T - -cf - 2>/dev/null")
+	if err != nil && tarData == "" {
+		return "", "", nil, nil, fmt.Errorf("reading %s on %s: %v", remoteDir, node.Name, err)
+	}
+	tmp, err := os.MkdirTemp("", "kubestui-compose-")
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	cleanup = func() { _ = os.RemoveAll(tmp) }
+	if err := untarInto(tmp, strings.NewReader(tarData)); err != nil {
+		cleanup()
+		return "", "", nil, nil, err
+	}
+	local = filepath.Join(tmp, path.Base(file))
+	if !fileExists(local) {
+		cleanup()
+		return "", "", nil, nil, fmt.Errorf("couldn't read %s on %s", file, node.Name)
+	}
+
+	// How much data each mounted folder holds there, so the import can
+	// suggest volume sizes that fit (and not copy huge media folders).
+	sizes = map[string]int64{}
+	if proj, err := loadCompose(local); err == nil {
+		var folders []string
+		for _, s := range proj.Services {
+			for _, v := range s.Volumes {
+				if v.Type != types.VolumeTypeBind || strings.HasPrefix(v.Source, "/dev/") {
+					continue
+				}
+				src := filepath.ToSlash(v.Source)
+				if !path.IsAbs(src) {
+					src = path.Join(remoteDir, src)
+				}
+				folders = append(folders, src)
+			}
+		}
+		if len(folders) > 0 {
+			q := make([]string, len(folders))
+			for i, f := range folders {
+				q[i] = shellQuote(f)
+			}
+			out, _ := fs.run("for f in " + strings.Join(q, " ") + `; do [ -d "$f" ] && printf '%s\t%s\n' "$(timeout 20 du -sb "$f" 2>/dev/null | cut -f1)" "$f"; done; true`)
+			for _, line := range strings.Split(out, "\n") {
+				if n, f, ok := strings.Cut(line, "\t"); ok {
+					if b, err := strconv.ParseInt(n, 10, 64); err == nil {
+						sizes[f] = b
+					}
+				}
+			}
+		}
+	}
+	return local, remoteDir, sizes, cleanup, nil
+}
+
+// untarInto extracts regular files and folders (nothing outside dir).
+func untarInto(dir string, r io.Reader) error {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		name := filepath.Clean(filepath.FromSlash(hdr.Name))
+		if name == "." || strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
+			continue
+		}
+		target := filepath.Join(dir, name)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(f, io.LimitReader(tr, hdr.Size))
+			f.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// launchComposeImport runs the import on the control plane. from is the
+// node the compose file is on (nil: this computer; file is local).
+func (w *workstation) launchComposeImport(file string, from *hostEntry) {
 	p := w.current
 	name := filepath.Base(filepath.Dir(file))
+	if from != nil {
+		name = path.Base(path.Dir(file))
+		if !strings.Contains(path.Base(file), ".") {
+			name = path.Base(file) // a folder was given
+		}
+	}
 	if p.demo {
 		termPage.Open(termLaunch{
 			title:  "DEMO · IMPORT DOCKER COMPOSE  ·  " + p.Name,
@@ -137,7 +354,20 @@ func (w *workstation) launchComposeImport(file string) {
 		okText:     "DEPLOYED",
 		sshConnect: w.dialer(p),
 		prepare: func(client *ssh.Client) (string, error) {
-			bundle, rels, err := composeBundle(file)
+			local, env := file, ""
+			if from != nil {
+				f, remoteDir, sizes, cleanup, err := fetchComposeFromNode(*from, []string{p.keyPath()}, file)
+				if err != nil {
+					return "", fmt.Errorf("getting the compose file from %s: %v", from.Name, err)
+				}
+				defer cleanup()
+				local = f
+				env = " COMPOSE_SOURCE_NODE=" + shellQuote(from.Name) + " COMPOSE_SOURCE_DIR=" + shellQuote(remoteDir)
+				if js, err := json.Marshal(sizes); err == nil && len(sizes) > 0 {
+					env += " COMPOSE_SOURCE_SIZES=" + shellQuote(string(js))
+				}
+			}
+			bundle, rels, err := composeBundle(local)
 			if err != nil {
 				return "", err
 			}
@@ -151,7 +381,7 @@ func (w *workstation) launchComposeImport(file string) {
 				return "", fmt.Errorf("upload failed: %v", err)
 			}
 			composePath := dir + "/" + filepath.ToSlash(rels[0])
-			cmd := "env COMPOSE_FILE=" + shellQuote(composePath) +
+			cmd := "env COMPOSE_FILE=" + shellQuote(composePath) + env +
 				" bash " + shellQuote(p.HomelabRoot+"/install.sh") + " --run compose-import"
 			if p.User != "root" {
 				cmd = "sudo -p '[sudo] password for %u: ' " + cmd
