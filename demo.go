@@ -537,7 +537,7 @@ func demoAppStorage(d *demoTerm) int {
 	}
 	first := strings.Fields(v.mount)[0]
 	base := first[strings.LastIndex(first, "/")+1:]
-	result, node, path := "", "", ""
+	result, node, path, created := "", "", "", ""
 	if n == 1 {
 		d.Print("\n  0) New Longhorn volume\n")
 		var claims []string
@@ -565,7 +565,8 @@ func demoAppStorage(d *demoTerm) int {
 			if !ok {
 				return d.exitCode()
 			}
-			result = "Longhorn volume " + orDefault(dnsName(name), def) + ", " + normSize(orDefault(size, "10Gi"))
+			created = orDefault(dnsName(name), def)
+			result = "Longhorn volume " + created + ", " + normSize(orDefault(size, "10Gi"))
 		} else {
 			result = "Longhorn volume " + claims[k-1]
 		}
@@ -603,12 +604,43 @@ func demoAppStorage(d *demoTerm) int {
 	}
 	d.Print("\n" + cGreen + "[ OK ]" + cReset + " " + v.mount + " -> " + result + "\n" +
 		"  Saved in apps/" + map[bool]string{true: "infrastructure", false: "applications"}[app.name == "qbittorrent"] + "/" + app.name + "/resources/storage-patch.yaml\n\n" +
-		cYellow + "[WARN]" + cReset + " Files in the old location are not copied to the new one.\n")
+		"Copy the files from the old location to the new one?\n" +
+		"  " + app.name + " is stopped while they are copied, then started with the new storage.\n")
+	a, ok := ask("Copy files (y/n) [y]: ")
+	if !ok {
+		return d.exitCode()
+	}
+	copyFiles := !strings.HasPrefix(strings.ToLower(a), "n")
+	if !copyFiles {
+		d.Print(cYellow + "[WARN]" + cReset + " Files in the old location are not copied; they stay where they are.\n")
+	}
 	if path != "" {
 		d.Print("  The folder is created if it's missing. If " + app.name + " can't write to it, run on " + node + ":\n" +
 			"    sudo chown -R 1000:1000 " + path + "\n")
 	}
 	d.Print("\n")
+	if copyFiles {
+		lines := []string{
+			cBlue + "[INFO]" + cReset + " Stopping " + app.name + " so its files can be copied (Argo CD paused for " + app.name + ")...",
+			cGreen + "[ OK ]" + cReset + " " + app.name + " stopped.",
+		}
+		if created != "" {
+			lines = append(lines, cGreen+"[ OK ]"+cReset+" Created Longhorn volume "+created+".")
+		}
+		lines = append(lines,
+			cBlue+"[INFO]"+cReset+" Copying files (this can take a while for large folders)...",
+			"Copying 38.2G from the old location...",
+			"  copied so far: 11.4G",
+			"  copied so far: 24.9G",
+			"  copied so far: 38.2G",
+			"Copied. New location now holds 38.2G.",
+			cGreen+"[ OK ]"+cReset+" Files copied.",
+			"",
+		)
+		if !d.Lines(600*time.Millisecond, lines...) {
+			return d.exitCode()
+		}
+	}
 	if !d.Lines(700*time.Millisecond,
 		cGreen+"[ OK ]"+cReset+" Pushed: Change storage of "+app.name,
 		"",

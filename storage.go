@@ -429,6 +429,11 @@ func findStorageApps(root string) ([]*storageApp, []string) {
 			if kustomizationPath(dir) == "" {
 				continue
 			}
+			// Apps homelabCD left out (wg-easy without the VPN) are in the
+			// repo but not in the cluster.
+			if !argoAppDeployed(str(dig(a, "metadata"), "name")) {
+				continue
+			}
 			app, err := loadStorageApp(str(dig(a, "metadata"), "name"), str(dig(spec, "destination"), "namespace"), dir)
 			if err != nil {
 				problems = append(problems, err.Error())
@@ -442,6 +447,15 @@ func findStorageApps(root string) ([]*storageApp, []string) {
 	})
 	sort.Slice(apps, func(i, j int) bool { return apps[i].name < apps[j].name })
 	return apps, problems
+}
+
+// argoAppDeployed: true if Argo CD has the app, or if that can't be asked.
+func argoAppDeployed(name string) bool {
+	out, err := exec.Command("kubectl", "-n", "argocd", "get", "application", name, "-o", "name").CombinedOutput()
+	if err == nil {
+		return true
+	}
+	return !strings.Contains(string(out), "NotFound")
 }
 
 // System folders a pod may mount from its node; not app data.
@@ -794,14 +808,14 @@ func runAppStorage() int {
 	}
 
 	after, _ := loadStorageApp(app.name, app.namespace, app.dir)
+	var aw *storageWorkload
+	var av *storageVolume
 	fmt.Println()
 	if after != nil {
-		for _, aw := range after.workloads {
-			if aw.name != w.name {
-				continue
-			}
-			for _, av := range aw.volumes {
-				if av.name == v.name {
+		if aw = after.workload(w.kind, w.name); aw != nil {
+			for _, x := range aw.volumes {
+				if x.name == v.name {
+					av = x
 					fmt.Println(cOK + strings.Join(av.mounts, ", ") + " -> " + av.describe(after, aw))
 				}
 			}
@@ -810,7 +824,23 @@ func runAppStorage() int {
 	rel, _ := filepath.Rel(root, filepath.Join(app.dir, storagePatchFile))
 	fmt.Println("  Saved in " + filepath.ToSlash(rel))
 	fmt.Println()
-	fmt.Println(cWarn + "Files in the old location are not copied to the new one.")
+
+	plan := ""
+	if av != nil {
+		var why string
+		plan, why = storageCopyPlan(app, w, v, aw, av)
+		switch {
+		case plan != "":
+			fmt.Println("Copy the files from the old location to the new one?")
+			fmt.Println("  " + app.name + " is stopped while they are copied, then started with the new storage.")
+			if !in.yes("Copy files", true) {
+				plan = ""
+				fmt.Println(cWarn + "Files in the old location are not copied; they stay where they are.")
+			}
+		case why != "":
+			fmt.Println(cWarn + "Files are not copied: " + why)
+		}
+	}
 	if what == 2 {
 		if p := pw.volume(v.name); p != nil {
 			owner := orDefault(w.puid, "1000")
@@ -818,8 +848,48 @@ func runAppStorage() int {
 			fmt.Println("    sudo chown -R " + owner + ":" + owner + " " + p.path)
 		}
 	}
-	writeResult(app.name)
+	writeResult(app.name + "\n" + plan)
 	return 0
+}
+
+// storageCopyPlan describes the copy for install.sh (KEY=value lines), or
+// says why there is nothing to copy.
+func storageCopyPlan(app *storageApp, w *storageWorkload, v *storageVolume, aw *storageWorkload, av *storageVolume) (string, string) {
+	src := func(x *storageVolume) string { return x.kind + ":" + x.claim + x.path }
+	if src(v) == src(av) {
+		return "", ""
+	}
+	for _, x := range []*storageVolume{v, av} {
+		if x.kind != "longhorn" && x.kind != "host" {
+			return "", "" // temporary or NFS: nothing to copy or not ours to move
+		}
+	}
+	fromNode, toNode := "", ""
+	if v.kind == "host" {
+		if fromNode = w.pin; fromNode == "" {
+			return "", "the old folder isn't tied to one node, so it's unclear which node has the files."
+		}
+	}
+	if av.kind == "host" {
+		toNode = aw.pin
+	}
+	if fromNode != "" && toNode != "" && fromNode != toNode {
+		return "", "both folders are on different nodes (" + fromNode + ", " + toNode + "); copy them yourself, e.g. with rsync over SSH."
+	}
+	node := orDefault(fromNode, toNode)
+	typ := map[string]string{"longhorn": "pvc", "host": "host"}
+	lines := []string{
+		"COPY=1",
+		"NS=" + orDefault(w.namespace, app.namespace),
+		"KIND=" + strings.ToLower(w.kind),
+		"NAME=" + w.name,
+		"FROM_TYPE=" + typ[v.kind],
+		"FROM=" + v.claim + v.path,
+		"TO_TYPE=" + typ[av.kind],
+		"TO=" + av.claim + av.path,
+		"NODE=" + node,
+	}
+	return strings.Join(lines, "\n") + "\n", ""
 }
 
 // writeStorageKustomization makes kustomization.yaml (original text
