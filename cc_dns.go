@@ -268,6 +268,11 @@ func (c *commandCenter) drawDNS(screen tcell.Screen, in ccRect) int {
 		case v.Configured:
 			lines = append(lines, "  [gray]Connecting to "+tview.Escape(v.URL)+"…[-]")
 		default:
+			if v.Connecting != "" {
+				lines = append(lines, "  [aqua::b]Connecting to "+tview.Escape(v.Connecting)+"…[-::-]", "")
+			} else if v.ConnErr != "" {
+				lines = append(lines, "  [red::b]Couldn't connect:[-::-] [red]"+tview.Escape(v.ConnErr)+"[-]", "  [gray]Press[-] [aqua::b]C[-::-] [gray]to try again.[-]", "")
+			}
 			if v.Found != "" {
 				lines = append(lines, "  [green]Found a Pi-hole at[-] [::b]"+tview.Escape(v.Found)+"[::-] [gray](one of this computer's DNS servers)[-]", "")
 			}
@@ -614,7 +619,7 @@ func (c *commandCenter) dnsForm(addr string) {
 			uiApp.SetFocus(prev)
 		}
 	}
-	form.AddButton("Connect", func() {
+	connect := func() {
 		base := form.GetFormItem(0).(*tview.InputField).GetText()
 		pw := form.GetFormItem(1).(*tview.InputField).GetText()
 		closeForm()
@@ -624,14 +629,30 @@ func (c *commandCenter) dnsForm(addr string) {
 			c.app.QueueUpdateDraw(func() {
 				if err != nil {
 					c.flash("[red]Pi-hole: " + tview.Escape(err.Error()) + "[-]")
+					showChoice("Pi-hole", "Couldn't connect to the Pi-hole:\n\n"+err.Error(), []string{"Try again", "Close"}, func(label string) {
+						if label == "Try again" {
+							c.dnsForm(base)
+						}
+					})
 				} else {
 					c.flash("[green]Pi-hole connected: reading its query log.[-]")
 				}
 			})
 		}()
-	})
+	}
+	form.AddButton("Connect", connect)
 	form.AddButton("Cancel", closeForm)
 	form.SetCancelFunc(closeForm)
+	// ENTER in the password box connects (tview would only move to the button).
+	form.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		if ev.Key() == tcell.KeyEnter {
+			if i, _ := form.GetFocusedItemIndex(); i == 1 {
+				connect()
+				return nil
+			}
+		}
+		return ev
+	})
 	styleForm(form)
 	form.SetTitle(" Connect Pi-hole ")
 	uiPages.AddPage("ask", centered(form, 64, 9), true, true)

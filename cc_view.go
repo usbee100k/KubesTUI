@@ -1617,6 +1617,9 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 	switch ev.Key() {
 	case tcell.KeyEscape:
 		switch {
+		case c.socMode() && c.socPage != 0: // NETWORK/DNS → INCIDENTS, then out of the zoom
+			c.socPage = 0
+			c.st[pAlerts].sel, c.st[pAlerts].selKey, c.st[pAlerts].top = 0, "", 0
 		case c.zoom:
 			c.zoom = false
 		case c.search != "" || c.nsFilter != "":

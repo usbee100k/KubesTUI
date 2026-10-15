@@ -137,6 +137,8 @@ type phView struct {
 	Hosts                          []phHost
 	NoDNS                          []string // LAN devices that never asked the Pi-hole (IP)
 	CertChanged                    bool
+	Connecting                     string // address C is connecting to now
+	ConnErr                        string // why the last C failed
 	HourQueries, HourBlocked       int
 	HourStart                      time.Time
 	QPM                            ccRing // queries per minute (from the query log)
@@ -352,7 +354,24 @@ func probePihole(hc *http.Client, host string) string {
 
 // Connect logs in with a new address and password and remembers them. The
 // certificate seen now is pinned.
-func (p *piholeClient) Connect(base, password string) error {
+func (p *piholeClient) Connect(base, password string) (err error) {
+	p.mu.Lock()
+	p.v.Connecting, p.v.ConnErr = orDefault(strings.TrimSpace(base), "?"), ""
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.v.Connecting = ""
+		if err != nil {
+			p.v.ConnErr = err.Error()
+		}
+		p.mu.Unlock()
+		if p.redraw != nil {
+			p.redraw()
+		}
+	}()
+	if strings.TrimSpace(password) == "" {
+		return errors.New("no password entered")
+	}
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	base = strings.TrimSuffix(base, "/admin")
 	base = strings.TrimSuffix(base, "/api")
@@ -400,10 +419,13 @@ func (p *piholeClient) Connect(base, password string) error {
 	p.v = phView{Configured: true, URL: base}
 	p.window = map[int64]phQuery{}
 	p.lastQ = 0
-	err := p.saveConf()
+	err = p.saveConf()
 	p.mu.Unlock()
 	p.Kick()
-	return err
+	if err != nil {
+		return fmt.Errorf("connected, but couldn't save the password: %w", err)
+	}
+	return nil
 }
 
 // Forget logs out and deletes the saved address and password.
