@@ -246,6 +246,11 @@ func loadSigners(paths ...string) []ssh.Signer {
 			paths = append(paths, filepath.Join(home, ".ssh", n))
 		}
 	}
+	return loadKeyFiles(paths...)
+}
+
+// loadKeyFiles returns signers for just these private key files.
+func loadKeyFiles(paths ...string) []ssh.Signer {
 	var signers []ssh.Signer
 	seen := map[string]bool{}
 	for _, p := range paths {
@@ -273,6 +278,7 @@ type dialTarget struct {
 	Port     int
 	User     string
 	Keys     []string // private key files to try first
+	OnlyKeys bool     // just Keys, not also ~/.ssh's
 	Password string   // used if set
 	Prompt   bool     // ask for a password if keys fail and Password is empty
 }
@@ -332,7 +338,11 @@ func dialSSH(t dialTarget) (*ssh.Client, error) {
 	}
 
 	var auth []ssh.AuthMethod
-	if signers := loadSigners(t.Keys...); len(signers) > 0 {
+	signers := loadSigners(t.Keys...)
+	if t.OnlyKeys {
+		signers = loadKeyFiles(t.Keys...)
+	}
+	if len(signers) > 0 {
 		auth = append(auth, ssh.PublicKeys(signers...))
 	}
 

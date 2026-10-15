@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go.yaml.in/yaml/v3"
+	"io/fs"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -311,8 +313,11 @@ type volumePlan struct {
 	size     string
 	cmName   string
 	cmKey    string
+	subPath  string // pvc: mount just this file of the volume (a bind-mounted file)
+	seedKey  string // pvc file: key in the app Secret with its first content ("" = the image's own file)
+	image    string // pvc file: the service's image (has the image's own file)
 	hostPath string
-	hostType string // hostpath: Directory / CharDevice ("" = no check)
+	hostType string // hostpath: Directory / CharDevice / File ("" = no check)
 	node     string // hostpath: pin to node
 	medium   string // emptydir
 	limit    string // emptydir
@@ -341,6 +346,11 @@ type importPlan struct {
 	// Folders to copy into their new volumes before the app starts (the
 	// compose file came from a node): node, folder there, claim.
 	copies [][3]string
+	// Files to copy (from another machine): node, file there, claim, name
+	// in the volume.
+	fileCopies [][4]string
+	// The compose project to stop on the machine before copying ("" no).
+	stop string
 }
 
 type pvcPlan struct {
@@ -457,6 +467,13 @@ func composeLocalFiles(file string) ([]string, error) {
 			}
 		}
 	}
+	// Host files a node import brought along.
+	_ = filepath.WalkDir(filepath.Join(base, hostCopyDir), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			add(p)
+		}
+		return nil
+	})
 	return out, nil
 }
 
@@ -570,8 +587,21 @@ func runComposeImport() int {
 	if srcDir == "" {
 		srcNode = ""
 	}
+	// Another machine over SSH (not a cluster node): its data is copied
+	// straight from it; its folders can't be used in place.
+	external := srcNode != "" && os.Getenv("COMPOSE_SOURCE_EXTERNAL") != ""
+	planFileCopy = nil
+	if external {
+		planFileCopy = func(sp *servicePlan, src, target, claim, name string) bool {
+			return copyFileFromMachine(in, plan, sp, srcNode, src, target, claim, name)
+		}
+	}
 	var srcSizes map[string]int64 // folder on the node -> bytes it holds
 	_ = json.Unmarshal([]byte(os.Getenv("COMPOSE_SOURCE_SIZES")), &srcSizes)
+	// Bind-mounted files (not folders) on the node -> bytes. Small ones
+	// came along under hostCopyDir next to the compose file.
+	var srcFiles map[string]int64
+	_ = json.Unmarshal([]byte(os.Getenv("COMPOSE_SOURCE_FILES")), &srcFiles)
 	// sizeFor suggests a volume size for a folder: its data plus room to
 	// grow when it was measured, else a default by its use.
 	sizeFor := func(folder, target string) string {
@@ -742,6 +772,16 @@ func runComposeImport() int {
 					local = filepath.Join(composeDir, src)
 				}
 				st, statErr := os.Stat(local)
+				// A file, not a folder? A folder volume can't be mounted
+				// onto a file ("not a directory"), so files get their own.
+				onNode := filepath.ToSlash(src)
+				if isRelativeSource(src) {
+					onNode = path.Join(srcDir, onNode)
+				}
+				_, nodeFile := srcFiles[onNode]
+				_, nodeFolder := srcSizes[onNode]
+				isFile := statErr == nil && st.Mode().IsRegular() || nodeFile ||
+					statErr != nil && !nodeFolder && looksLikeFile(v.Target)
 				switch {
 				case isRelativeSource(src) && statErr == nil && st.Mode().IsRegular() && st.Size() <= maxConfigBytes:
 					data, _ := os.ReadFile(local)
@@ -753,6 +793,16 @@ func runComposeImport() int {
 					plan.configMap[cm][key] = string(data)
 					vp.kind, vp.cmName, vp.cmKey = "configmap", cm, key
 					fmt.Printf("  File %s -> %s: stored in the app (ConfigMap)\n", src, v.Target)
+				case src == "/etc/localtime" || src == "/etc/timezone":
+					vp.kind, vp.hostPath, vp.hostType = "hostpath", src, "File" // every node has it
+				case isFile && !strings.HasPrefix(src, "/dev/"):
+					var data []byte
+					if statErr == nil && st.Mode().IsRegular() && st.Size() <= maxConfigBytes {
+						data, _ = os.ReadFile(local)
+					} else if b, err := os.ReadFile(filepath.Join(composeDir, hostCopyDir, filepath.FromSlash(strings.TrimPrefix(onNode, "/")))); err == nil {
+						data = b
+					}
+					planFileVolume(plan, sp, vp, s.Image, onNode, v.Target, data)
 				case isRelativeSource(src):
 					claim := uniqueClaim(plan, dnsName(sp.name+"-"+filepath.Base(src)))
 					folder := path.Join(srcDir, filepath.ToSlash(src))
@@ -767,6 +817,16 @@ func runComposeImport() int {
 					}
 				case strings.HasPrefix(src, "/dev/"):
 					vp.kind, vp.hostPath = "hostpath", src
+				case external:
+					fmt.Printf("  Folder %s -> %s:\n", src, v.Target)
+					if b, ok := srcSizes[src]; ok && b >= 50<<30 {
+						fmt.Printf("    %s holds %s on %s: copying that much takes a while (it goes over the network).\n", src, fmtBytes(b), srcNode)
+					}
+					claim := uniqueClaim(plan, dnsName(sp.name+"-"+filepath.Base(src)))
+					size := in.size("    Longhorn volume size", sizeFor(src, v.Target))
+					plan.pvcs[claim] = &pvcPlan{name: claim, size: size}
+					vp.kind, vp.claim = "pvc", claim
+					copyFromNode(in, plan, sp, srcNode, src, v.Target, claim)
 				default:
 					fmt.Printf("  Host path %s -> %s:\n", src, v.Target)
 					longhorn := "longhorn (new empty volume)"
@@ -937,6 +997,16 @@ func runComposeImport() int {
 	}
 	fmt.Println()
 
+	if external && (len(plan.copies) > 0 || len(plan.fileCopies) > 0) {
+		fmt.Println()
+		fmt.Printf("The data is copied from %s now. If the app keeps running there, files it\n", srcNode)
+		fmt.Println("writes during the copy (a database) can be copied half-written.")
+		project := dockerProjectName(file, srcDir)
+		if in.yes(fmt.Sprintf("Stop %s on %s first (docker stop; start it again there if you need it)", project, srcNode), true) {
+			plan.stop = project
+		}
+		fmt.Println()
+	}
 	if !in.yes("Create it and deploy through GitOps", true) {
 		fmt.Println(cWarn + "Cancelled. Nothing was written.")
 		return 1
@@ -955,8 +1025,14 @@ func runComposeImport() int {
 	}
 	fmt.Println(cOK + "Wrote " + appsDirRel + "/" + app + "/")
 	result := app
+	if plan.stop != "" {
+		result += "\nSTOP\t" + plan.stop
+	}
 	for _, c := range plan.copies {
 		result += "\nCOPY\t" + c[0] + "\t" + c[1] + "\t" + c[2]
+	}
+	for _, c := range plan.fileCopies {
+		result += "\nCOPYFILE\t" + c[0] + "\t" + c[1] + "\t" + c[2] + "\t" + c[3]
 	}
 	writeResult(result)
 	return 0
@@ -968,6 +1044,76 @@ func volumeSize(target string) string {
 		return "1Gi"
 	}
 	return "5Gi"
+}
+
+// hostCopyDir holds the small host files a node import brought along
+// (bind-mounted with an absolute path), at their path under it.
+const hostCopyDir = ".kubestui-host"
+
+// looksLikeFile guesses that a mount target is a file when nothing says
+// (the source wasn't measured): its name has a file extension.
+func looksLikeFile(target string) bool {
+	base := path.Base(filepath.ToSlash(target))
+	ext := strings.ToLower(path.Ext(base))
+	if ext == base || ext == ".d" { // .config, conf.d: folders
+		return false
+	}
+	return len(ext) >= 2 && len(ext) <= 11 && strings.Trim(ext[1:], "abcdefghijklmnopqrstuvwxyz0123456789") == "" &&
+		strings.ContainsAny(ext[1:], "abcdefghijklmnopqrstuvwxyz")
+}
+
+// dockerProjectName is the name Docker Compose gave the app on its
+// machine (its containers' com.docker.compose.project label): the file's
+// name:, else the folder it was in there.
+func dockerProjectName(file, dir string) string {
+	var top struct {
+		Name string `yaml:"name"`
+	}
+	if data, err := os.ReadFile(file); err == nil {
+		_ = yaml.Unmarshal(data, &top)
+	}
+	n := strings.ToLower(orDefault(strings.TrimSpace(top.Name), path.Base(dir)))
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return -1
+	}, n)
+}
+
+// planFileCopy, for an import from another machine, offers to copy a
+// file into its volume (true: it will be).
+var planFileCopy func(sp *servicePlan, src, target, claim, name string) bool
+
+func copyFileFromMachine(in *prompter, plan *importPlan, sp *servicePlan, node, src, target, claim, name string) bool {
+	fmt.Printf("  File %s -> %s: its own small volume the app can change\n", src, target)
+	if in.yes(fmt.Sprintf("    copy it from %s", node), true) {
+		plan.fileCopies = append(plan.fileCopies, [4]string{node, src, claim, name})
+		return true
+	}
+	return false
+}
+
+// planFileVolume: a bind-mounted file becomes a small Longhorn volume the
+// app can change, mounted as that one file (subPath). The pod's first
+// start fills it with data (the original file, kept in the app's Secret,
+// not git) or, without it, with the image's own file.
+func planFileVolume(plan *importPlan, sp *servicePlan, vp *volumePlan, image, src, target string, data []byte) {
+	name := path.Base(filepath.ToSlash(target))
+	claim := uniqueClaim(plan, dnsName(sp.name+"-"+name))
+	plan.pvcs[claim] = &pvcPlan{name: claim, size: "1Gi"}
+	vp.kind, vp.claim, vp.subPath, vp.image = "pvc", claim, name, image
+	if planFileCopy != nil && planFileCopy(sp, src, target, claim, name) {
+		return // copied in before the app starts
+	}
+	if data != nil {
+		vp.seedKey = sp.name + ".file." + configMapKey(src)
+		plan.secrets[vp.seedKey] = string(data)
+		fmt.Printf("  File %s -> %s: its own small volume the app can change, starting with that file\n", src, target)
+		return
+	}
+	fmt.Printf("  File %s -> %s: its own small volume the app can change, starting with the image's %s\n", src, target, name)
+	sp.warnings = append(sp.warnings, fmt.Sprintf("%s starts as the image's own file (%s wasn't brought along)", target, src))
 }
 
 // copyFromNode asks whether to bring a folder's data along (the compose

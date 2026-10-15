@@ -141,7 +141,7 @@ func (w *workstation) capture(ev *tcell.EventKey) *tcell.EventKey {
 		return ccPage.HandleKey(ev)
 	case "cclogs":
 		return ccPage.logs.HandleKey(ev)
-	case "ask", "pair", "sshform", "rjform", "vpnimport", "composeform":
+	case "ask", "pair", "sshform", "rjform", "vpnimport", "composeform", "machineform":
 		return ev
 	case "pairlog":
 		if w.pairDone {

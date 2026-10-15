@@ -262,6 +262,11 @@ func writeApp(root string, plan *importPlan) error {
 		if q := cpuQuantity(cpuReq); q != "" {
 			requests["cpu"] = q
 		}
+		if memReq == 0 && memLimit > 256<<20 {
+			// Only a limit (CasaOS sets it to all the host's memory):
+			// Kubernetes would reserve all of it on a node. Ask for little.
+			memReq = 256 << 20
+		}
 		if q := memQuantity(memReq); q != "" {
 			requests["memory"] = q
 		}
@@ -286,6 +291,7 @@ func writeApp(root string, plan *importPlan) error {
 
 		// Volumes and mounts.
 		var vols, mounts []obj
+		var seeds []fileSeed
 		hasRWO := false
 		var nodePin string
 		usesDRI := false
@@ -300,6 +306,10 @@ func writeApp(root string, plan *importPlan) error {
 				vols = append(vols, obj{"name": name, "persistentVolumeClaim": obj{"claimName": v.claim}})
 				if !plan.pvcs[v.claim].shared {
 					hasRWO = true
+				}
+				if v.subPath != "" {
+					m["subPath"] = v.subPath
+					seeds = append(seeds, fileSeed{vol: name, v: v})
 				}
 			case "configmap":
 				vols = append(vols, obj{"name": name, "configMap": obj{"name": v.cmName}})
@@ -358,6 +368,12 @@ func writeApp(root string, plan *importPlan) error {
 				"securityContext": obj{"privileged": true},
 				"command":         []string{"sh", "-c", "sysctl -w " + strings.Join(sysctls, " ")},
 			}}
+		}
+
+		if inits, extra := seedContainers(app, seeds, sec); len(inits) > 0 {
+			before, _ := pod["initContainers"].([]obj)
+			pod["initContainers"] = append(before, inits...)
+			pod["volumes"] = append(vols, extra...)
 		}
 
 		if s.NetworkMode == "host" {
@@ -733,4 +749,66 @@ func runComposeRemove() int {
 	fmt.Println(cOK + "Removed " + appsDirRel + "/" + app + "/")
 	writeResult(app)
 	return 0
+}
+
+// fileSeed is a bind-mounted file kept in its own volume (subPath).
+type fileSeed struct {
+	vol string
+	v   *volumePlan
+}
+
+// seedContainers fill each file volume once, before the app starts: with
+// the original file from the app's Secret, or with the image's own file
+// (the app's image, which has it). A subPath that doesn't exist would be
+// created as a folder, which can't be mounted onto a file.
+func seedContainers(app string, seeds []fileSeed, sec obj) (inits, vols []obj) {
+	if len(seeds) == 0 {
+		return nil, nil
+	}
+	owner := ""
+	if u, ok := sec["runAsUser"].(int64); ok {
+		owner = strconv.FormatInt(u, 10)
+		if g, ok := sec["runAsGroup"].(int64); ok {
+			owner += ":" + strconv.FormatInt(g, 10)
+		}
+	}
+	var fromSecret, fromImage []string
+	var secMounts, imgMounts []obj
+	var items []obj
+	for i, sd := range seeds {
+		dst := fmt.Sprintf("/seed/%d/%s", i, sd.v.subPath)
+		m := obj{"name": sd.vol, "mountPath": fmt.Sprintf("/seed/%d", i)}
+		cmd := ""
+		if sd.v.seedKey != "" {
+			cmd = fmt.Sprintf("[ -e %[1]s ] || cp /seed-src/%[2]s %[1]s", shellQuote(dst), shellQuote(sd.v.seedKey))
+		} else {
+			cmd = fmt.Sprintf("[ -e %[1]s ] || cp %[2]s %[1]s 2>/dev/null || : > %[1]s", shellQuote(dst), shellQuote(sd.v.target))
+		}
+		if owner != "" {
+			cmd += "; chown " + owner + " " + shellQuote(dst)
+		}
+		if sd.v.seedKey != "" {
+			fromSecret, secMounts = append(fromSecret, cmd), append(secMounts, m)
+			items = append(items, obj{"key": sd.v.seedKey, "path": sd.v.seedKey})
+		} else {
+			fromImage, imgMounts = append(fromImage, cmd), append(imgMounts, m)
+		}
+	}
+	root := obj{"runAsUser": int64(0)}
+	if len(fromSecret) > 0 {
+		inits = append(inits, obj{
+			"name": "seed-files", "image": "busybox:1.37", "securityContext": root,
+			"command":      []string{"sh", "-c", strings.Join(fromSecret, "\n")},
+			"volumeMounts": append(secMounts, obj{"name": "seed-src", "mountPath": "/seed-src", "readOnly": true}),
+		})
+		vols = append(vols, obj{"name": "seed-src", "secret": obj{"secretName": app + "-secrets", "items": items}})
+	}
+	if len(fromImage) > 0 {
+		inits = append(inits, obj{
+			"name": "seed-image-files", "image": seeds[0].v.image, "securityContext": root,
+			"command":      []string{"sh", "-c", strings.Join(fromImage, "\n")},
+			"volumeMounts": imgMounts,
+		})
+	}
+	return inits, vols
 }

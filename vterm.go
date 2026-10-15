@@ -25,6 +25,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/crypto/ssh/agent"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"golang.org/x/crypto/ssh"
@@ -44,6 +46,10 @@ type termView struct {
 	*tview.Box
 
 	app *tview.Application
+
+	// agent, if set, is forwarded to the SSH session (ssh -A): programs
+	// there can use its keys, only while the session lasts.
+	agent agent.Agent
 
 	mu       sync.Mutex
 	vt       vt10x.Terminal
@@ -380,6 +386,11 @@ func (t *termView) StartSSH(client *ssh.Client, command string, onExit func(code
 		ssh.ECHO:          1,
 		ssh.TTY_OP_ISPEED: 38400,
 		ssh.TTY_OP_OSPEED: 38400,
+	}
+	if t.agent != nil {
+		if err := agent.ForwardToAgent(client, t.agent); err == nil {
+			_ = agent.RequestAgentForwarding(session)
+		}
 	}
 	if err := session.RequestPty("xterm-256color", t.rows, t.cols, modes); err != nil {
 		session.Close()

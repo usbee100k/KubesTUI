@@ -9,6 +9,7 @@ package main
 
 import (
 	"fmt"
+	"golang.org/x/crypto/ssh/agent"
 	"os"
 	"strings"
 	"time"
@@ -37,6 +38,8 @@ type termLaunch struct {
 	// prepare, if set, runs on the new connection and returns the command
 	// to run instead of command (e.g. after uploading a file).
 	prepare func(client *ssh.Client) (string, error)
+	// agent, if set, is forwarded to the SSH session (see termView.agent).
+	agent agent.Agent
 
 	// demo, if set, runs a simulated session instead (demo.go).
 	demo func(dt *demoTerm) int
@@ -225,6 +228,7 @@ func (s *termScreen) Open(l termLaunch, onBack func()) {
 
 	// A fresh emulator per session, so old output never lingers.
 	tv := newTermView(s.app)
+	tv.agent = l.agent
 	s.body.RemoveItem(s.tv)
 	s.tv = tv
 	s.body.AddItem(s.tv, 0, 1, true)
