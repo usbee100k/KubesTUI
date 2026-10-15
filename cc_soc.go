@@ -591,6 +591,101 @@ func socLevel(threat float64) (string, string) {
 
 func (c *commandCenter) socMode() bool { return c.zoom && c.focus == pAlerts && c.soc != nil }
 
+// socBack (ESC, Z): one step back in the SOC console: a box shown alone →
+// its page, DNS → NETWORK → INCIDENTS. False on INCIDENTS (the caller
+// leaves the zoom).
+func (c *commandCenter) socBack() bool {
+	switch {
+	case !c.socMode():
+		return false
+	case c.socBig > 0:
+		c.socBig = 0
+	case c.socPage > 0:
+		c.socPage--
+		c.st[pAlerts].sel, c.st[pAlerts].selKey, c.st[pAlerts].top = 0, "", 0
+	default:
+		return false
+	}
+	return true
+}
+
+// socBox is one box of a SOC page. TAB shows each alone over the page to
+// read it closer.
+type socBox struct {
+	title string
+	table bool // the page's table (↑↓ and ENTER keep working)
+	build func(w int) []string
+	empty string
+}
+
+// socPanel draws a box of lines and registers it for TAB. A box with no
+// room (a narrow window) is only registered, so TAB still shows it.
+func (c *commandCenter) socPanel(screen tcell.Screen, r ccRect, title, empty string, build func(w int) []string) {
+	c.socBoxes = append(c.socBoxes, socBox{title: title, build: build, empty: empty})
+	if r.w < 12 || r.h < 3 {
+		return
+	}
+	socTitle(screen, r, title)
+	socLines(screen, r.inner(), build(r.inner().w-1), empty)
+}
+
+// drawSOCBig draws box socBig alone over the page body (below the two
+// header lines). hits is where the page's mouse hits start.
+func (c *commandCenter) drawSOCBig(screen tcell.Screen, in ccRect, hits int) {
+	if c.socBig > len(c.socBoxes) {
+		c.socBig = 0
+		return
+	}
+	body := ccRect{in.x, in.y + 2, in.w, in.h - 2}
+	if body.h < 3 {
+		return
+	}
+	b := c.socBoxes[c.socBig-1]
+	clearRect(screen, body)
+	c.hits = c.hits[:hits]
+	tag := fmt.Sprintf(" · TAB %d/%d · ESC back", c.socBig, len(c.socBoxes))
+	if b.table {
+		socTitle(screen, body, b.title+tag)
+		rowsY := c.drawTable(screen, pAlerts, body.inner())
+		c.hits = append(c.hits, ccHit{r: body, panel: pAlerts, rowsY: rowsY})
+		return
+	}
+	inner := body.inner()
+	lines := b.build(inner.w - 1)
+	c.socBigH = inner.h
+	c.socBigTop = max(0, min(c.socBigTop, len(lines)-inner.h))
+	if len(lines) > inner.h {
+		tag = fmt.Sprintf(" · %d-%d of %d, ↑↓ scroll", c.socBigTop+1, min(len(lines), c.socBigTop+inner.h), len(lines)) + tag
+	}
+	socTitle(screen, body, b.title+tag)
+	socLines(screen, inner, lines[c.socBigTop:], b.empty)
+}
+
+// socScroll scrolls a box shown alone (not the table, which keeps its own
+// selection). False if the key isn't for it.
+func (c *commandCenter) socScroll(k tcell.Key) bool {
+	if !c.socMode() || c.socBig == 0 || c.socBig > len(c.socBoxes) || c.socBoxes[c.socBig-1].table {
+		return false
+	}
+	page := max(1, c.socBigH-1)
+	switch k {
+	case tcell.KeyUp:
+		c.socBigTop--
+	case tcell.KeyDown:
+		c.socBigTop++
+	case tcell.KeyPgUp:
+		c.socBigTop -= page
+	case tcell.KeyPgDn:
+		c.socBigTop += page
+	case tcell.KeyHome:
+		c.socBigTop = 0
+	case tcell.KeyEnd:
+		c.socBigTop = 1 << 30
+	}
+	c.socBigTop = max(0, c.socBigTop) // the draw clamps the bottom
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
@@ -682,16 +777,15 @@ func (c *commandCenter) drawSOC(screen tcell.Screen, in ccRect) int {
 		rightW = max(40, min(70, body.w*34/100))
 	}
 	q := ccRect{body.x, body.y, body.w - rightW, midH}
-	socTitle(screen, q, fmt.Sprintf("INCIDENT QUEUE · %d", len(st.findings)))
+	title := fmt.Sprintf("INCIDENT QUEUE · %d", len(st.findings))
+	c.socBoxes = append(c.socBoxes, socBox{title: title, table: true})
+	socTitle(screen, q, title)
 	rowsY := c.drawTable(screen, pAlerts, q.inner())
 	c.hits = append(c.hits, ccHit{r: q, panel: pAlerts, rowsY: rowsY})
 
-	if rightW > 0 {
-		c.drawSOCRight(screen, ccRect{body.x + q.w, body.y, rightW, midH})
-	}
-	if streamH > 0 {
-		c.drawSOCStream(screen, ccRect{body.x, body.y + midH, body.w, streamH})
-	}
+	// Without room these only register their boxes (TAB shows them).
+	c.drawSOCRight(screen, ccRect{body.x + q.w, body.y, rightW, midH})
+	c.drawSOCStream(screen, ccRect{body.x, body.y + midH, body.w, streamH})
 	return rowsY
 }
 
@@ -709,30 +803,28 @@ func (c *commandCenter) drawSOCRight(screen tcell.Screen, r ccRect) {
 	}
 	tacticsH := min(len(socTactics)+2, r.h/3+2)
 	tb := ccRect{r.x, r.y, r.w, tacticsH}
-	socTitle(screen, tb, "ATT&CK TACTICS")
-	in := tb.inner()
 	most := 1
 	for _, n := range byTactic {
 		most = max(most, n)
 	}
-	for i, t := range socTactics {
-		if i >= in.h {
-			break
+	c.socPanel(screen, tb, "ATT&CK TACTICS", "", func(w int) []string {
+		var l []string
+		for _, t := range socTactics {
+			n := byTactic[t]
+			bw := max(0, w-24)
+			bar := strings.Repeat("■", (n*bw+most-1)/most)
+			col := "#3a3a3a"
+			if n > 0 {
+				col = socSevColors[worst[t]]
+			}
+			l = append(l, fmt.Sprintf("%-21s[%s]%s[-] [::b]%d[::-]", t, col, bar, n))
 		}
-		n := byTactic[t]
-		bw := max(0, in.w-25)
-		bar := strings.Repeat("■", (n*bw+most-1)/most)
-		col := "#3a3a3a"
-		if n > 0 {
-			col = socSevColors[worst[t]]
-		}
-		put(screen, fmt.Sprintf("%-21s[%s]%s[-] [::b]%d[::-]", t, col, bar, n), in.x+1, in.y+i, in.w-1)
-	}
+		return l
+	})
 
 	rest := r.h - tacticsH
 	surfH := rest / 2
 	sb := ccRect{r.x, r.y + tacticsH, r.w, surfH}
-	socTitle(screen, sb, "ATTACK SURFACE · ways in from the LAN")
 	var lines []string
 	for _, svc := range s.Services {
 		switch svc.Type {
@@ -749,10 +841,10 @@ func (c *commandCenter) drawSOCRight(screen tcell.Screen, r ccRect) {
 			lines = append(lines, "[red]PLN[-] http://"+ing.Host+" [red]no TLS[-]")
 		}
 	}
-	socLines(screen, sb.inner(), lines, "nothing exposed")
+	surface := lines
+	c.socPanel(screen, sb, "ATTACK SURFACE · ways in from the LAN", "nothing exposed", func(int) []string { return surface })
 
 	ab := ccRect{r.x, r.y + tacticsH + surfH, r.w, rest - surfH}
-	socTitle(screen, ab, "ASSETS")
 	lines = nil
 	for _, n := range s.Nodes {
 		col := "green"
@@ -777,7 +869,7 @@ func (c *commandCenter) drawSOCRight(screen tcell.Screen, r ccRect) {
 		lines = append(lines, fmt.Sprintf("[%s]●[-] %-9s %s [%s]%-11s[-] [gray]%s k%s up %s · %dp[-]",
 			col, fit(n.Name, 9, false), role, col, n.status(), n.Kubelet, kern, up, n.Pods))
 	}
-	socLines(screen, ab.inner(), lines, "no nodes")
+	c.socPanel(screen, ab, "ASSETS", "no nodes", func(int) []string { return lines })
 }
 
 func socLines(screen tcell.Screen, in ccRect, lines []string, empty string) {
@@ -832,17 +924,12 @@ func (c *commandCenter) drawSOCStream(screen tcell.Screen, r ccRect) {
 		lines = append(lines, line{f.t, fmt.Sprintf("[gray]%s[-] [%s::b]%s[-::-]", f.t.Local().Format("15:04:05"), f.color, tview.Escape(f.text))})
 	}
 	sort.SliceStable(lines, func(i, j int) bool { return lines[i].t.After(lines[j].t) })
-	socTitle(screen, r, fmt.Sprintf("LIVE STREAM · warning events + detections · %d", len(lines)))
-	in := r.inner()
+	text := make([]string, len(lines))
 	for i, l := range lines {
-		if i >= in.h {
-			break
-		}
-		put(screen, " "+l.text, in.x, in.y+i, in.w)
+		text[i] = l.text
 	}
-	if len(lines) == 0 {
-		put(screen, "[gray] quiet: no warning events[-]", in.x, in.y, in.w)
-	}
+	c.socPanel(screen, r, fmt.Sprintf("LIVE STREAM · warning events + detections · %d", len(lines)), "quiet: no warning events",
+		func(int) []string { return text })
 }
 
 // socTable is the incident queue.

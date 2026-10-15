@@ -357,13 +357,12 @@ func (c *commandCenter) drawDNS(screen tcell.Screen, in ccRect) int {
 		rightW = max(50, min(84, body.w*42/100))
 	}
 	q := ccRect{body.x, body.y, body.w - rightW, body.h}
-	socTitle(screen, q, fmt.Sprintf("DEVICES ON THE PI-HOLE · %d", len(v.Clients)))
+	title := fmt.Sprintf("DEVICES ON THE PI-HOLE · %d", len(v.Clients))
+	c.socBoxes = append(c.socBoxes, socBox{title: title, table: true})
+	socTitle(screen, q, title)
 	rowsY := c.drawTable(screen, pAlerts, q.inner())
 	c.hits = append(c.hits, ccHit{r: q, panel: pAlerts, rowsY: rowsY})
-	if rightW == 0 {
-		return rowsY
-	}
-	r := ccRect{body.x + q.w, body.y, rightW, body.h}
+	r := ccRect{body.x + q.w, body.y, rightW, body.h} // no room: boxes only for TAB
 	names := map[string]string{}
 	for _, cl := range v.Clients {
 		names[cl.IP] = cl.Name
@@ -387,36 +386,35 @@ func (c *commandCenter) drawDNS(screen tcell.Screen, in ccRect) int {
 	}
 	dh := min(max(len(det), 1)+2, r.h/4+1)
 	db := ccRect{r.x, r.y, r.w, dh}
-	socTitle(screen, db, "DETECTIONS · last hour")
-	socLines(screen, db.inner(), det, "[green]nothing suspicious in the lookups[-]")
+	c.socPanel(screen, db, "DETECTIONS · last hour", "[green]nothing suspicious in the lookups[-]", func(int) []string { return det })
 
 	rest := r.h - dh
 	th := min(rest/2, 14)
 	tb := ccRect{r.x, r.y + dh, r.w, th}
-	socTitle(screen, tb, "TOP 24H · allowed │ blocked")
-	half := (tb.inner().w - 3) / 2
-	var lines []string
-	for i := 0; i < max(len(v.TopDomains), len(v.TopBlocked)); i++ {
-		a, b := "", ""
-		if i < len(v.TopDomains) {
-			a = fmt.Sprintf("%6s %s", fmtCount(v.TopDomains[i].Count), fit(v.TopDomains[i].Name, half-8, false))
+	c.socPanel(screen, tb, "TOP 24H · allowed │ blocked", "no queries yet", func(w int) []string {
+		half := (w - 2) / 2
+		var l []string
+		for i := 0; i < max(len(v.TopDomains), len(v.TopBlocked)); i++ {
+			a, b := "", ""
+			if i < len(v.TopDomains) {
+				a = fmt.Sprintf("%6s %s", fmtCount(v.TopDomains[i].Count), fit(v.TopDomains[i].Name, half-8, false))
+			}
+			if i < len(v.TopBlocked) {
+				b = fmt.Sprintf("[red]%6s[-] %s", fmtCount(v.TopBlocked[i].Count), tview.Escape(fit(v.TopBlocked[i].Name, half-8, false)))
+			}
+			l = append(l, fmt.Sprintf("%-*s [gray]│[-] %s", half, tview.Escape(a), b))
 		}
-		if i < len(v.TopBlocked) {
-			b = fmt.Sprintf("[red]%6s[-] %s", fmtCount(v.TopBlocked[i].Count), tview.Escape(fit(v.TopBlocked[i].Name, half-8, false)))
-		}
-		lines = append(lines, fmt.Sprintf("%-*s [gray]│[-] %s", half, tview.Escape(a), b))
-	}
-	socLines(screen, tb.inner(), lines, "no queries yet")
+		return l
+	})
 
 	sb := ccRect{r.x, r.y + dh + th, r.w, rest - th}
-	socTitle(screen, sb, "LIVE LOOKUPS")
-	lines = nil
+	var lines []string
 	for _, qq := range v.Recent {
 		who := orDefault(names[qq.Client.IP], qq.Client.IP)
 		lines = append(lines, fmt.Sprintf("[gray]%s[-] [%s]%-5s[-] %-14s [gray]%-5s[-] %s", qq.at().Local().Format("15:04:05"), phStatusColor(qq), phStatusShort(qq),
 			tview.Escape(fit(who, 14, false)), tview.Escape(fit(qq.Type, 5, false)), tview.Escape(qq.Domain)))
 	}
-	socLines(screen, sb.inner(), lines, "waiting for lookups…")
+	c.socPanel(screen, sb, "LIVE LOOKUPS", "waiting for lookups…", func(int) []string { return lines })
 	return rowsY
 }
 

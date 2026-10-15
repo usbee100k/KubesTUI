@@ -351,18 +351,16 @@ func (c *commandCenter) drawNet(screen tcell.Screen, in ccRect) int {
 		rightW = max(46, min(76, body.w*40/100))
 	}
 	q := ccRect{body.x, body.y, body.w - rightW, body.h}
-	socTitle(screen, q, fmt.Sprintf("LAN DEVICES · %d online of %d", online, total))
+	title := fmt.Sprintf("LAN DEVICES · %d online of %d", online, total)
+	c.socBoxes = append(c.socBoxes, socBox{title: title, table: true})
+	socTitle(screen, q, title)
 	rowsY := c.drawTable(screen, pAlerts, q.inner())
 	c.hits = append(c.hits, ccHit{r: q, panel: pAlerts, rowsY: rowsY})
-	if rightW == 0 {
-		return rowsY
-	}
-	r := ccRect{body.x + q.w, body.y, rightW, body.h}
+	r := ccRect{body.x + q.w, body.y, rightW, body.h} // no room: boxes only for TAB
 
 	// Latency (and, for nodes, their traffic from the kubelet).
 	lh := min(len(v.Probes)+2, r.h/2)
 	lb := ccRect{r.x, r.y, r.w, lh}
-	socTitle(screen, lb, "LATENCY · TCP connect, last 20")
 	var lines []string
 	for _, p := range v.Probes {
 		col := "green"
@@ -390,12 +388,12 @@ func (c *commandCenter) drawNet(screen tcell.Screen, in ccRect) int {
 		lines = append(lines, fmt.Sprintf("[%s]●[-] %-10s %s [%s]%7s[-] [gray]loss %3d%%[-]%s",
 			col, fit(p.Name, 10, false), spark(vals, 16, top), col, last, p.Fails*5, extra))
 	}
-	socLines(screen, lb.inner(), lines, "probing…")
+	latency := lines
+	c.socPanel(screen, lb, "LATENCY · TCP connect, last 20", "probing…", func(int) []string { return latency })
 
 	rest := r.h - lh
 	sh := rest / 2
 	sb := ccRect{r.x, r.y + lh, r.w, sh}
-	socTitle(screen, sb, fmt.Sprintf("SITES · %d ingress hosts", len(v.Services)))
 	lines = nil
 	for _, sv := range v.Services {
 		col, what := "green", fmt.Sprintf("%d", sv.Status)
@@ -424,10 +422,10 @@ func (c *commandCenter) drawNet(screen tcell.Screen, in ccRect) int {
 		}
 		lines = append(lines, fmt.Sprintf("[%s]●[-] %-26s [%s]%-5s[-] %6s %s %s", col, fit(sv.Host, 26, false), col, tview.Escape(fit(what, 5, false)), fmtMS(sv.Took), dnsS, tlsS))
 	}
-	socLines(screen, sb.inner(), lines, "checking…")
+	sites := lines
+	c.socPanel(screen, sb, fmt.Sprintf("SITES · %d ingress hosts", len(v.Services)), "checking…", func(int) []string { return sites })
 
 	cb := ccRect{r.x, r.y + lh + sh, r.w, rest - sh}
-	socTitle(screen, cb, "THIS HOST · top talkers · listening")
 	type talker struct {
 		ip, proc string
 		n        int
@@ -485,7 +483,7 @@ func (c *commandCenter) drawNet(screen tcell.Screen, in ccRect) int {
 	if len(listen) > 0 {
 		lines = append([]string{"[yellow]open to the LAN:[-] " + strings.Join(listen, " ")}, lines...)
 	}
-	socLines(screen, cb.inner(), lines, "no connections")
+	c.socPanel(screen, cb, "THIS HOST · top talkers · listening", "no connections", func(int) []string { return lines })
 	return rowsY
 }
 

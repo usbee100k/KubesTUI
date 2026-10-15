@@ -118,7 +118,11 @@ type commandCenter struct {
 	soc     *socState // the SOC console (alerts panel zoomed)
 
 	socShowBase bool       // V in the SOC console: list baseline findings
-	socPage     int        // 0 incidents, 1 network (N)
+	socPage     int        // 0 incidents, 1 network, 2 DNS (N forward, ESC back)
+	socBoxes    []socBox   // the current page's boxes (rebuilt every draw)
+	socBig      int        // TAB: box shown alone over the page (1-based, 0 none)
+	socBigTop   int        // its scroll position
+	socBigH     int        // its visible rows
 	net         *netSensor // started when the SOC console first opens
 
 	// actionsBlocked explains why changes aren't allowed ("" = allowed).
@@ -163,7 +167,7 @@ func (c *commandCenter) Open(src ccSource, name string, back func()) {
 	c.coll = newCCCollector(src)
 	c.snap, c.hist, c.soc = nil, newCCHistory(), newSOCState()
 	c.netStop()
-	c.socPage = 0
+	c.socPage, c.socBig = 0, 0
 	c.overlay, c.zoom, c.searching = nil, false, false
 	c.nsFilter, c.search = "", ""
 	c.st = [ccPanelCount]ccPanelState{}
@@ -452,12 +456,17 @@ func (c *commandCenter) drawSlot(screen tcell.Screen, s ccSlot) {
 		c.drawCluster(screen, in)
 	} else if act == pAlerts && c.socMode() {
 		c.netStart()
+		c.socBoxes = c.socBoxes[:0]
+		nh := len(c.hits)
 		if c.socPage == 1 && c.net != nil {
 			c.drawNet(screen, in) // adds the table's own hit
 		} else if c.socPage == 2 && c.net != nil {
 			c.drawDNS(screen, in)
 		} else {
 			c.drawSOC(screen, in)
+		}
+		if c.socBig > 0 {
+			c.drawSOCBig(screen, in, nh)
 		}
 	} else {
 		hit.rowsY = c.drawTable(screen, act, in)
@@ -524,13 +533,13 @@ func (c *commandCenter) titleInfo(p ccPanelID) string {
 					tabs = append(tabs, "[gray]"+strings.ToLower(name)+"[-]")
 				}
 			}
-			pages := "[gray]N[-] " + strings.Join(tabs, " ")
-			hint := "ENTER case · V baseline"
+			pages := strings.Join(tabs, " ")
+			hint := "N network · ENTER case · V baseline · TAB boxes"
 			switch c.socPage {
 			case 1:
-				hint = "ENTER device · K known · U sweep"
+				hint = "N DNS · ENTER device · K known · U sweep · TAB boxes · ESC back"
 			case 2:
-				hint = "ENTER device · C connect · A fix site records"
+				hint = "ENTER device · C connect · A fix site records · TAB boxes · ESC back"
 			}
 			return fmt.Sprintf("[#48dbfb::b]◉ SOC[-::-] %s [gray]· threat[-] [%s::b]%s[-::-] [gray]· %s · %s[-]", pages, col, level, hint, time.Now().Format("15:04:05"))
 		}
@@ -1617,9 +1626,7 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 	switch ev.Key() {
 	case tcell.KeyEscape:
 		switch {
-		case c.socMode() && c.socPage != 0: // NETWORK/DNS → INCIDENTS, then out of the zoom
-			c.socPage = 0
-			c.st[pAlerts].sel, c.st[pAlerts].selKey, c.st[pAlerts].top = 0, "", 0
+		case c.socBack():
 		case c.zoom:
 			c.zoom = false
 		case c.search != "" || c.nsFilter != "":
@@ -1630,6 +1637,15 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 		}
 		return nil
 	case tcell.KeyTab, tcell.KeyBacktab:
+		if c.socMode() { // the SOC page's boxes, one at a time over the page
+			n := len(c.socBoxes) + 1
+			step := 1
+			if ev.Key() == tcell.KeyBacktab {
+				step = n - 1
+			}
+			c.socBig, c.socBigTop = (c.socBig+step)%n, 0
+			return nil
+		}
 		vis := c.visiblePanels()
 		for i, p := range vis {
 			if p == c.focus {
@@ -1645,6 +1661,12 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			c.focus = vis[0]
 		}
 		return nil
+	case tcell.KeyUp, tcell.KeyDown, tcell.KeyPgUp, tcell.KeyPgDn, tcell.KeyHome, tcell.KeyEnd:
+		if c.socScroll(ev.Key()) {
+			return nil
+		}
+	}
+	switch ev.Key() {
 	case tcell.KeyUp:
 		c.move(c.focus, -1)
 	case tcell.KeyDown:
@@ -1713,7 +1735,9 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			c.suspend() // ESC in Files comes back here (resume)
 			open(ns, pvc)
 		case r == 'z' || r == 'Z' || r == 'f' || r == 'F':
-			c.zoom = !c.zoom
+			if !c.socBack() {
+				c.zoom = !c.zoom
+			}
 		case r == 'p' || r == 'P' || r == ' ':
 			c.pause.Store(!c.pause.Load())
 			if !c.pause.Load() {
@@ -1746,9 +1770,12 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 				}
 			}
 		case r == 'n' || r == 'N':
-			if c.socMode() { // the SOC console's pages
-				c.socPage = (c.socPage + 1) % 3
-				c.st[pAlerts].sel, c.st[pAlerts].selKey, c.st[pAlerts].top = 0, "", 0
+			if c.socMode() { // INCIDENTS → NETWORK → DNS (ESC goes back)
+				if c.socPage < 2 {
+					c.socPage++
+					c.socBig = 0
+					c.st[pAlerts].sel, c.st[pAlerts].selKey, c.st[pAlerts].top = 0, "", 0
+				}
 				break
 			}
 			c.nsFilter = ""
