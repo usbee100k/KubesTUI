@@ -2271,7 +2271,7 @@ func main() {
 	openCC = func() { ccPage.Open(nodeCCSource(), cluster.Name, backToMain) }
 	openFiles = func() { openNodeFiles(app, pages, footer, activity.last, "", backToMain) }
 	ccPage.onFiles = func(ns, pvc string) {
-		openNodeFiles(app, pages, footer, activity.last, volumeLabel(ns, pvc), backToMain)
+		openNodeFiles(app, pages, footer, activity.last, volumeLabel(ns, pvc), ccPage.resume)
 	}
 	ccPage.onStorage = func() {
 		for _, op := range operations {

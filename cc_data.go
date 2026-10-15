@@ -79,6 +79,71 @@ type ccPod struct {
 	HasUsage                                      bool
 	CPUReq, MemReq, CPULim, MemLim                int64
 	Containers                                    []ccContainer
+	Sec                                           ccPodSec
+}
+
+// ccPodSec: what a pod may do on its node (for the SOC view).
+type ccPodSec struct {
+	Privileged []string // containers
+	HostNS     []string // network, pid, ipc
+	HostPaths  []string
+	Caps       []string // added capabilities
+	MayRoot    []string // containers not forced to run as non-root
+	PrivEsc    []string // containers allowed to gain privileges
+	Mutable    []string // images without a fixed tag (:latest or none)
+	NoMemLimit []string // containers
+	SA         string
+	Token      bool // service account token mounted
+}
+
+// podSecurity reads a pod's security-relevant settings.
+func podSecurity(hostNet, hostPID, hostIPC bool, podCtx *kSecurityContext, sa string, automount *bool, cs []kContainer) ccPodSec {
+	sec := ccPodSec{SA: orDefault(sa, "default"), Token: automount == nil || *automount}
+	for n, on := range map[string]bool{"network": hostNet, "pid": hostPID, "ipc": hostIPC} {
+		if on {
+			sec.HostNS = append(sec.HostNS, n)
+		}
+	}
+	sort.Strings(sec.HostNS)
+	podNonRoot := podCtx != nil && ((podCtx.RunAsNonRoot != nil && *podCtx.RunAsNonRoot) || (podCtx.RunAsUser != nil && *podCtx.RunAsUser > 0))
+	for _, c := range cs {
+		sc := c.SecurityContext
+		if sc == nil {
+			sc = &kSecurityContext{}
+		}
+		if sc.Privileged != nil && *sc.Privileged {
+			sec.Privileged = append(sec.Privileged, c.Name)
+		}
+		if sc.Capabilities != nil {
+			for _, cp := range sc.Capabilities.Add {
+				sec.Caps = append(sec.Caps, strings.TrimPrefix(strings.ToUpper(cp), "CAP_"))
+			}
+		}
+		nonRoot := podNonRoot
+		if sc.RunAsNonRoot != nil {
+			nonRoot = *sc.RunAsNonRoot
+		}
+		if sc.RunAsUser != nil {
+			nonRoot = *sc.RunAsUser > 0
+		}
+		if !nonRoot {
+			sec.MayRoot = append(sec.MayRoot, c.Name)
+		}
+		if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			sec.PrivEsc = append(sec.PrivEsc, c.Name)
+		}
+		img := c.Image
+		if i := strings.LastIndex(img, "/"); i >= 0 {
+			img = img[i+1:]
+		}
+		if !strings.Contains(c.Image, "@sha256:") && (!strings.Contains(img, ":") || strings.HasSuffix(img, ":latest")) {
+			sec.Mutable = append(sec.Mutable, c.Image)
+		}
+		if c.Resources.Limits["memory"] == "" {
+			sec.NoMemLimit = append(sec.NoMemLimit, c.Name)
+		}
+	}
+	return sec
 }
 
 func (p *ccPod) key() string { return p.NS + "/" + p.Name }
@@ -169,6 +234,11 @@ type ccCert struct {
 	NotAfter         time.Time
 }
 
+type ccBinding struct {
+	Name     string
+	Subjects []string // Kind:namespace/name
+}
+
 type ccAlert struct {
 	Level   int // 2 critical, 1 warning
 	Object  string
@@ -210,6 +280,12 @@ type ccSnapshot struct {
 	// Ready nodes with a Longhorn disk where its engine doesn't run, so no
 	// copies can be kept there (control planes without the toleration).
 	NoEngine []string
+
+	// For the SOC view: who is bound to cluster-admin, and which
+	// namespaces have a network policy (HasPolicies: the API answered).
+	AdminBindings []ccBinding
+	PolicyNS      map[string]bool
+	HasPolicies   bool
 
 	// Section errors, shown in the panels ("metrics-server not installed").
 	Errs map[string]string
@@ -291,6 +367,9 @@ var ccSlowPaths = []string{
 	"/apis/apps/v1/daemonsets",
 	"/apis/metallb.io/v1beta1/ipaddresspools",
 	"/apis/cert-manager.io/v1/certificates",
+	"/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
+	"/apis/networking.k8s.io/v1/networkpolicies",
+	"/apis/cilium.io/v2/ciliumnetworkpolicies",
 }
 
 func statsPath(node string) string {
@@ -402,6 +481,7 @@ func (c *ccCollector) Collect() *ccSnapshot {
 		s.Workloads, s.Certs, s.Pools = p.Workloads, p.Certs, p.Pools
 		s.HasApps, s.HasLonghorn, s.HasCerts = p.HasApps, p.HasLonghorn, p.HasCerts
 		s.NoEngine = p.NoEngine
+		s.AdminBindings, s.PolicyNS, s.HasPolicies = p.AdminBindings, p.PolicyNS, p.HasPolicies
 		for _, k := range []string{"apps", "storage", "network", "events", "certs"} {
 			if e, ok := p.Errs[k]; ok {
 				s.Errs[k] = e
@@ -480,6 +560,24 @@ func (c *ccCollector) readSlow(s *ccSnapshot, got map[string]ccResult) {
 		}
 		if r := got["/apis/longhorn.io/v1beta2/engineimages"]; r.err == nil {
 			s.NoEngine = longhornNoEngine(r.data, s.Disks, s.Nodes)
+		}
+	}
+	if r := got["/apis/rbac.authorization.k8s.io/v1/clusterrolebindings"]; r.err == nil {
+		s.AdminBindings = parseAdminBindings(r.data)
+	}
+	s.PolicyNS = map[string]bool{}
+	for _, path := range []string{"/apis/networking.k8s.io/v1/networkpolicies", "/apis/cilium.io/v2/ciliumnetworkpolicies"} {
+		if r := got[path]; r.err == nil {
+			s.HasPolicies = true
+			var list struct {
+				Items []struct {
+					Metadata kMeta `json:"metadata"`
+				} `json:"items"`
+			}
+			_ = json.Unmarshal(r.data, &list)
+			for _, it := range list.Items {
+				s.PolicyNS[it.Metadata.Namespace] = true
+			}
 		}
 	}
 	if r := got["/api/v1/persistentvolumeclaims"]; r.err == nil {
@@ -746,6 +844,17 @@ type kContainer struct {
 		Requests map[string]string `json:"requests"`
 		Limits   map[string]string `json:"limits"`
 	} `json:"resources"`
+	SecurityContext *kSecurityContext `json:"securityContext"`
+}
+
+type kSecurityContext struct {
+	Privileged               *bool  `json:"privileged"`
+	RunAsNonRoot             *bool  `json:"runAsNonRoot"`
+	RunAsUser                *int64 `json:"runAsUser"`
+	AllowPrivilegeEscalation *bool  `json:"allowPrivilegeEscalation"`
+	Capabilities             *struct {
+		Add []string `json:"add"`
+	} `json:"capabilities"`
 }
 
 func parseCCPods(data []byte) []ccPod {
@@ -753,9 +862,21 @@ func parseCCPods(data []byte) []ccPod {
 		Items []struct {
 			Metadata kMeta `json:"metadata"`
 			Spec     struct {
-				NodeName       string       `json:"nodeName"`
-				Containers     []kContainer `json:"containers"`
-				InitContainers []kContainer `json:"initContainers"`
+				NodeName        string            `json:"nodeName"`
+				Containers      []kContainer      `json:"containers"`
+				InitContainers  []kContainer      `json:"initContainers"`
+				HostNetwork     bool              `json:"hostNetwork"`
+				HostPID         bool              `json:"hostPID"`
+				HostIPC         bool              `json:"hostIPC"`
+				SecurityContext *kSecurityContext `json:"securityContext"`
+				ServiceAccount  string            `json:"serviceAccountName"`
+				AutomountToken  *bool             `json:"automountServiceAccountToken"`
+				Volumes         []struct {
+					Name     string `json:"name"`
+					HostPath *struct {
+						Path string `json:"path"`
+					} `json:"hostPath"`
+				} `json:"volumes"`
 			} `json:"spec"`
 			Status struct {
 				Phase             string             `json:"phase"`
@@ -778,6 +899,13 @@ func parseCCPods(data []byte) []ccPod {
 		if len(it.Metadata.OwnerReferences) > 0 {
 			o := it.Metadata.OwnerReferences[0]
 			p.Owner = o.Kind + "/" + o.Name
+		}
+		p.Sec = podSecurity(it.Spec.HostNetwork, it.Spec.HostPID, it.Spec.HostIPC, it.Spec.SecurityContext,
+			it.Spec.ServiceAccount, it.Spec.AutomountToken, append(append([]kContainer{}, it.Spec.InitContainers...), it.Spec.Containers...))
+		for _, v := range it.Spec.Volumes {
+			if v.HostPath != nil {
+				p.Sec.HostPaths = append(p.Sec.HostPaths, v.HostPath.Path)
+			}
 		}
 		status := map[string]kContainerStatus{}
 		for _, cs := range it.Status.ContainerStatuses {
@@ -1169,6 +1297,42 @@ func parseLonghornDisks(data []byte) []ccDisk {
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Node < out[j].Node })
+	return out
+}
+
+// parseAdminBindings: ClusterRoleBindings to cluster-admin.
+func parseAdminBindings(data []byte) []ccBinding {
+	var list struct {
+		Items []struct {
+			Metadata kMeta `json:"metadata"`
+			RoleRef  struct {
+				Kind string `json:"kind"`
+				Name string `json:"name"`
+			} `json:"roleRef"`
+			Subjects []struct {
+				Kind      string `json:"kind"`
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"subjects"`
+		} `json:"items"`
+	}
+	_ = json.Unmarshal(data, &list)
+	var out []ccBinding
+	for _, it := range list.Items {
+		if it.RoleRef.Kind != "ClusterRole" || it.RoleRef.Name != "cluster-admin" {
+			continue
+		}
+		b := ccBinding{Name: it.Metadata.Name}
+		for _, sub := range it.Subjects {
+			n := sub.Name
+			if sub.Namespace != "" {
+				n = sub.Namespace + "/" + n
+			}
+			b.Subjects = append(b.Subjects, sub.Kind+":"+n)
+		}
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

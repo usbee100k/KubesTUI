@@ -115,6 +115,11 @@ type commandCenter struct {
 
 	overlay *ccOverlay
 	logs    *ccLogs
+	soc     *socState // the SOC console (alerts panel zoomed)
+
+	socShowBase bool       // V in the SOC console: list baseline findings
+	socPage     int        // 0 incidents, 1 network (N)
+	net         *netSensor // started when the SOC console first opens
 
 	// actionsBlocked explains why changes aren't allowed ("" = allowed).
 	actionsBlocked func() string
@@ -156,7 +161,9 @@ func (c *commandCenter) Open(src ccSource, name string, back func()) {
 	c.Close()
 	c.src, c.name, c.back = src, name, back
 	c.coll = newCCCollector(src)
-	c.snap, c.hist = nil, newCCHistory()
+	c.snap, c.hist, c.soc = nil, newCCHistory(), newSOCState()
+	c.netStop()
+	c.socPage = 0
 	c.overlay, c.zoom, c.searching = nil, false, false
 	c.nsFilter, c.search = "", ""
 	c.st = [ccPanelCount]ccPanelState{}
@@ -178,10 +185,34 @@ func (c *commandCenter) Close() {
 		c.stop = nil
 	}
 	c.logs.stopPolling()
+	c.netStop()
 	if c.src != nil {
 		c.src.Close()
 		c.src = nil
 	}
+}
+
+// suspend stops polling but keeps the source and everything on screen
+// (panel, zoom, selection), for a screen opened from here that comes
+// back with resume (Files from the Storage panel).
+func (c *commandCenter) suspend() {
+	if c.stop != nil {
+		close(c.stop)
+		c.stop = nil
+	}
+	c.logs.stopPolling()
+}
+
+// resume shows the Command Center again as it was left.
+func (c *commandCenter) resume() {
+	if c.src == nil {
+		return
+	}
+	if c.stop == nil {
+		c.start()
+	}
+	c.show()
+	c.refreshNow()
 }
 
 func (c *commandCenter) leave() {
@@ -206,6 +237,10 @@ func (c *commandCenter) start() {
 				if c.stop == stop {
 					c.snap = snap
 					c.hist.add(snap)
+					if c.net != nil {
+						c.net.setTargets(snap)
+					}
+					c.soc.observe(snap, c.netFindings())
 				}
 			})
 			for {
@@ -243,6 +278,8 @@ func (c *commandCenter) setFooter() {
 			extra = "    [aqua::b]L[-::-] Logs    [aqua::b]X[-::-] Restart pod"
 		case "Node":
 			extra = "    [aqua::b]C[-::-] Cordon/uncordon"
+		case "Device":
+			extra = "    [aqua::b]K[-::-] Mark known"
 		}
 		c.footer.SetText(" [aqua::b]↑↓[-::-] Scroll" + extra + "    [aqua::b]ESC[-::-] Close")
 		return
@@ -413,6 +450,15 @@ func (c *commandCenter) drawSlot(screen tcell.Screen, s ccSlot) {
 	in := s.r.inner()
 	if act == pCluster {
 		c.drawCluster(screen, in)
+	} else if act == pAlerts && c.socMode() {
+		c.netStart()
+		if c.socPage == 1 && c.net != nil {
+			c.drawNet(screen, in) // adds the table's own hit
+		} else if c.socPage == 2 && c.net != nil {
+			c.drawDNS(screen, in)
+		} else {
+			c.drawSOC(screen, in)
+		}
 	} else {
 		hit.rowsY = c.drawTable(screen, act, in)
 	}
@@ -467,6 +513,27 @@ func (c *commandCenter) titleInfo(p ccPanelID) string {
 			return "[gray]sort[-] " + nodeSorts[c.nodeSort]
 		}
 	case pAlerts:
+		if s != nil && c.socMode() {
+			threat, _, _ := c.soc.scores()
+			level, col := socLevel(threat)
+			var tabs []string
+			for i, name := range []string{"INCIDENTS", "NETWORK", "DNS"} {
+				if i == c.socPage {
+					tabs = append(tabs, "[white::b]"+name+"[-::-]")
+				} else {
+					tabs = append(tabs, "[gray]"+strings.ToLower(name)+"[-]")
+				}
+			}
+			pages := "[gray]N[-] " + strings.Join(tabs, " ")
+			hint := "ENTER case · V baseline"
+			switch c.socPage {
+			case 1:
+				hint = "ENTER device · K known · U sweep"
+			case 2:
+				hint = "ENTER device · C connect · A fix site records"
+			}
+			return fmt.Sprintf("[#48dbfb::b]◉ SOC[-::-] %s [gray]· threat[-] [%s::b]%s[-::-] [gray]· %s · %s[-]", pages, col, level, hint, time.Now().Format("15:04:05"))
+		}
 		if s != nil {
 			crit, warn := 0, 0
 			for _, a := range s.Alerts {
@@ -573,6 +640,15 @@ func (c *commandCenter) table(p ccPanelID, width int) *ccTable {
 	case pStorage:
 		return c.storageTable(width)
 	case pAlerts:
+		if c.netPage() {
+			return c.netTable()
+		}
+		if c.dnsPage() {
+			return c.dnsTable()
+		}
+		if c.socMode() {
+			return c.socTable()
+		}
 		return c.alertsTable()
 	}
 	return &ccTable{}
@@ -1351,6 +1427,22 @@ func (c *commandCenter) enter() {
 	case pStorage:
 		c.openTarget(ccTarget{Kind: "Volume", Name: key})
 	case pAlerts:
+		if mac, ok := strings.CutPrefix(key, "d/"); ok {
+			c.openNetDevice(mac)
+			return
+		}
+		if ip, ok := strings.CutPrefix(key, "c/"); ok {
+			c.openDNSClient(ip)
+			return
+		}
+		if key == "base" {
+			c.socShowBase = true
+			return
+		}
+		if strings.HasPrefix(key, "s/") || strings.HasPrefix(key, "r/") {
+			c.openSOCCase(key)
+			return
+		}
 		if strings.HasPrefix(key, "a/") {
 			for _, a := range c.snap.Alerts {
 				if fmt.Sprintf("a/%s/%s", a.Object, a.Message) == key {
@@ -1509,6 +1601,11 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 				if o.target.Kind == "Node" {
 					c.toggleCordon(o.target.Name)
 				}
+			case 'k', 'K':
+				if o.target.Kind == "Device" && c.net != nil {
+					c.net.markKnown(o.target.Name)
+					c.flash("[green]" + tview.Escape(o.target.Name) + " marked known.[-]")
+				}
 			case 'q', 'Q':
 				c.closeOverlay()
 			}
@@ -1610,7 +1707,7 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 				ns, pvc = parts[2], parts[3]
 			}
 			open := c.onFiles
-			c.Close()
+			c.suspend() // ESC in Files comes back here (resume)
 			open(ns, pvc)
 		case r == 'z' || r == 'Z' || r == 'f' || r == 'F':
 			c.zoom = !c.zoom
@@ -1635,6 +1732,10 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 					c.restartPod(ns, name)
 				}
 			}
+		case (r == 'c' || r == 'C') && c.dnsPage():
+			c.dnsConnect()
+		case (r == 'a' || r == 'A') && c.dnsPage():
+			c.dnsFix()
 		case r == 'c' || r == 'C':
 			if c.focus == pNodes && c.snap != nil {
 				if name := c.selected(pNodes); name != "" {
@@ -1642,12 +1743,27 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 				}
 			}
 		case r == 'n' || r == 'N':
+			if c.socMode() { // the SOC console's pages
+				c.socPage = (c.socPage + 1) % 3
+				c.st[pAlerts].sel, c.st[pAlerts].selKey, c.st[pAlerts].top = 0, "", 0
+				break
+			}
 			c.nsFilter = ""
 		case r == 'e' || r == 'E':
 			if c.focus == pStorage && c.onStorage != nil {
 				open := c.onStorage
 				c.Close()
 				open()
+			}
+		case (r == 'v' || r == 'V') && c.socMode():
+			c.socShowBase = !c.socShowBase
+		case (r == 'u' || r == 'U') && c.netPage():
+			c.net.Rescan()
+			c.flash("[aqua]Sweeping the LAN now.[-]")
+		case (r == 'k' || r == 'K') && c.netPage():
+			if mac, ok := strings.CutPrefix(c.selected(pAlerts), "d/"); ok {
+				c.net.markKnown(mac)
+				c.flash("[green]" + tview.Escape(mac) + " marked known.[-]")
 			}
 		case r == 'b' || r == 'B':
 			if c.focus == pStorage && c.onSpread != nil {

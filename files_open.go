@@ -30,11 +30,12 @@ func statusLight(status string) string {
 
 // openFiles (workstation): this computer and every node; node-to-node
 // copies run kubectl on the control plane over SSH.
-func (w *workstation) openFiles() { w.openFilesAt("") }
+func (w *workstation) openFiles() { w.openFilesAt("", w.showCluster) }
 
 // openFilesAt opens Files with the right pane on a location (e.g. a
-// Longhorn volume from the Command Center); "" for the default.
-func (w *workstation) openFilesAt(right string) {
+// Longhorn volume from the Command Center); "" for the default. ESC goes
+// to back.
+func (w *workstation) openFilesAt(right string, back func()) {
 	p := w.current
 	rows := w.nodeCache
 	if len(rows) == 0 && w.activity != nil {
@@ -118,7 +119,7 @@ func (w *workstation) openFilesAt(right string) {
 				cp.Close()
 			}
 			mu.Unlock()
-			w.showCluster()
+			back()
 		},
 	})
 }

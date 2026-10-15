@@ -624,6 +624,7 @@ func (w *workstation) actions() map[string][]wsAction {
 			{title: "SSH Console", desc: "Shell on any node; set up key login per node", run: w.openSSHConsole},
 			{title: "Open k9s", desc: "Browse pods, logs and events in k9s on this computer (downloads it the first time)", run: w.openK9s},
 			{title: "Files", desc: "Two-pane file manager across this computer and every node: browse, preview, copy/move (node to node directly), rename, delete", run: w.openFiles},
+			{title: "Trust Cluster Certificates", desc: "Install the cluster's own root CAs (Homelab Root CA, Rancher, any others) on this computer so browsers trust its sites; or save them for your phone", run: w.openTrustCA},
 			{title: "Transfer Files to a Node", desc: "Drop files or folders from this computer and copy them to any node over SSH (default /home/<user>/)", run: w.transferFiles},
 		},
 		secCluster: {
@@ -781,7 +782,7 @@ func (w *workstation) openCommandCenter() {
 		w.clusterNote.SetText("  [yellow]" + tview.Escape(err.Error()) + "[-]")
 		return
 	}
-	ccPage.onFiles = func(ns, pvc string) { w.openFilesAt(volumeLabel(ns, pvc)) }
+	ccPage.onFiles = func(ns, pvc string) { w.openFilesAt(volumeLabel(ns, pvc), ccPage.resume) }
 	ccPage.onStorage = func() {
 		w.runAction(wsAction{title: "Change App Storage", op: "app-storage"})
 	}

@@ -222,7 +222,7 @@ func (d *demoCCSource) get(path string) (any, error) {
 			}
 			pod := obj2{
 				"metadata": obj2{"name": name, "namespace": p.ns, "creationTimestamp": time.Now().Add(-age).UTC().Format(time.RFC3339),
-					"ownerReferences": []obj2{{"kind": "ReplicaSet", "name": strings.TrimSuffix(name, name[strings.LastIndex(name, "-"):])}}},
+					"ownerReferences": []obj2{demoOwner(name)}},
 				"spec": obj2{"nodeName": node, "containers": []obj2{{"name": strings.Split(name, "-")[0], "image": p.image,
 					"resources": obj2{"requests": obj2{"cpu": fmt.Sprintf("%dm", int(p.cpu/2+10)), "memory": fmt.Sprintf("%dMi", int(p.mem/2+16))},
 						"limits": obj2{"memory": fmt.Sprintf("%dMi", int(p.mem*2+64))}}}}},
@@ -231,6 +231,7 @@ func (d *demoCCSource) get(path string) (any, error) {
 			if cs != nil {
 				pod["status"].(obj2)["containerStatuses"] = []obj2{cs}
 			}
+			demoPodSecurity(pod, p.ns, name)
 			items = append(items, pod)
 		}
 		return obj2{"items": items}, nil
@@ -308,7 +309,11 @@ func (d *demoCCSource) get(path string) (any, error) {
 			ing("jellyfin", "jellyfin.homelab.example", "jellyfin", 8096),
 			ing("nextcloud", "cloud.homelab.example", "nextcloud", 80),
 			ing("n8n", "n8n.homelab.example", "n8n", 5678),
-			ing("qbittorrent", "torrent.homelab.example", "qbittorrent", 8080),
+			func() obj2 { // the one left on plain http
+				i := ing("qbittorrent", "torrent.homelab.example", "qbittorrent", 8080)
+				delete(i["spec"].(obj2), "tls")
+				return i
+			}(),
 			ing("wg-easy", "vpn.homelab.example", "wg-easy", 51821),
 		}}, nil
 	case path == "/apis/argoproj.io/v1alpha1/applications":
@@ -350,6 +355,18 @@ func (d *demoCCSource) get(path string) (any, error) {
 			vol("pvc-5e6f", "n8n", "n8n-data", "cp3", "healthy", 5, 0.4),
 			vol("pvc-8a9b", "argocd", "redis-data", "cp1", "healthy", 1, 0.1),
 		}}, nil
+	case path == "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings":
+		crb := func(name string, subjects ...obj2) obj2 {
+			return obj2{"metadata": obj2{"name": name}, "roleRef": obj2{"kind": "ClusterRole", "name": "cluster-admin"}, "subjects": subjects}
+		}
+		return obj2{"items": []obj2{
+			crb("cluster-admin", obj2{"kind": "Group", "name": "system:masters"}),
+			crb("kubeadm:cluster-admins", obj2{"kind": "Group", "name": "kubeadm:cluster-admins"}),
+			crb("cattle-admin-binding", obj2{"kind": "ServiceAccount", "name": "rancher", "namespace": "cattle-system"}),
+			crb("n8n-cluster-access", obj2{"kind": "ServiceAccount", "name": "n8n", "namespace": "n8n"}),
+		}}, nil
+	case path == "/apis/networking.k8s.io/v1/networkpolicies":
+		return obj2{"items": []obj2{{"metadata": obj2{"name": "default-deny", "namespace": "nextcloud"}}}}, nil
 	case path == "/apis/longhorn.io/v1beta2/replicas":
 		var items []obj2
 		for vol, nodes := range map[string][]string{"pvc-1a2b": {"w1", "cp1"}, "pvc-3c4d": {"w1", "w1"},
@@ -424,4 +441,66 @@ func demoLogs(pod string) string {
 		}
 	}
 	return b.String()
+}
+
+// demoPodSecurity gives the demo pods the security settings real ones have
+// (for the SOC console): system agents privileged on the host, a VPN
+// with NET_ADMIN, a media server mounting node folders, ...
+func demoPodSecurity(pod obj2, ns, name string) {
+	spec := pod["spec"].(obj2)
+	c := spec["containers"].([]obj2)[0]
+	sc := obj2{}
+	c["securityContext"] = sc
+	hostPath := func(paths ...string) {
+		var vols []obj2
+		for i, p := range paths {
+			vols = append(vols, obj2{"name": fmt.Sprintf("host%d", i), "hostPath": obj2{"path": p}})
+		}
+		spec["volumes"] = vols
+	}
+	switch {
+	case strings.HasPrefix(name, "cilium-") && !strings.HasPrefix(name, "cilium-operator"):
+		sc["privileged"] = true
+		spec["hostNetwork"] = true
+		hostPath("/sys/fs/bpf", "/proc", "/run/cilium")
+	case strings.HasPrefix(name, "longhorn-csi-plugin"), strings.HasPrefix(name, "longhorn-manager"):
+		sc["privileged"] = true
+		hostPath("/var/lib/kubelet", "/dev", "/var/lib/longhorn")
+	case strings.HasPrefix(name, "kube-apiserver"), strings.HasPrefix(name, "etcd"):
+		spec["hostNetwork"] = true
+		hostPath("/etc/kubernetes/pki")
+	case strings.HasPrefix(name, "home-assistant"):
+		spec["hostNetwork"] = true
+		sc["privileged"] = true
+		hostPath("/run/dbus")
+	case strings.HasPrefix(name, "jellyfin"):
+		hostPath("/mnt/media")
+	case strings.HasPrefix(name, "wg-easy"):
+		sc["capabilities"] = obj2{"add": []string{"NET_ADMIN", "SYS_MODULE"}}
+	case strings.HasPrefix(name, "qbittorrent"):
+		sc["capabilities"] = obj2{"add": []string{"NET_ADMIN"}}
+	case strings.HasPrefix(name, "n8n"):
+		spec["serviceAccountName"] = "n8n"
+		c["image"] = "n8nio/n8n:latest"
+	case ns == "argocd" || ns == "cert-manager":
+		sc["runAsNonRoot"] = true
+		sc["allowPrivilegeEscalation"] = false
+	}
+	if name == "nextcloud-db-0" {
+		delete(c["resources"].(obj2), "limits")
+	}
+}
+
+// demoOwner: the controller a demo pod belongs to.
+func demoOwner(name string) obj2 {
+	parent := strings.TrimSuffix(name, name[strings.LastIndex(name, "-"):])
+	switch {
+	case strings.HasPrefix(name, "kube-apiserver-"), strings.HasPrefix(name, "etcd-"):
+		return obj2{"kind": "Node", "name": name[strings.LastIndex(name, "-")+1:]}
+	case strings.HasSuffix(name, "-0"):
+		return obj2{"kind": "StatefulSet", "name": parent}
+	case strings.HasPrefix(name, "longhorn-csi-plugin-"), strings.HasPrefix(name, "cilium-") && !strings.HasPrefix(name, "cilium-operator"):
+		return obj2{"kind": "DaemonSet", "name": parent}
+	}
+	return obj2{"kind": "ReplicaSet", "name": parent}
 }
