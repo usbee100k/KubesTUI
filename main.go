@@ -1669,6 +1669,10 @@ func generateJoinCommand(
 
 	const tokenCmd = "kubeadm token create --ttl 2h --print-join-command"
 	const certsCmd = "kubeadm init phase upload-certs --upload-certs"
+	const readyCmd = `echo "@self=$(hostname -s | tr '[:upper:]' '[:lower:]')"; ` +
+		"kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes" +
+		" -l node-role.kubernetes.io/control-plane --request-timeout=15s -o jsonpath=" +
+		`'{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'`
 
 	var certsOutput string
 
@@ -1706,6 +1710,20 @@ func generateJoinCommand(
 		output = string(raw)
 
 		if controlPlane {
+			ready, _ := exec.Command("sudo", "-n", "sh", "-c", readyCmd).Output()
+
+			run := func(script string) (string, error) {
+				cmd := exec.Command("sudo", "sh", "-c", script)
+				cmd.Stdin = os.Stdin
+				cmd.Stderr = os.Stderr
+				out, err := cmd.Output()
+				return strings.TrimSpace(string(out)), err
+			}
+
+			if err := planControlPlanes(reader, string(ready), run); err != nil {
+				return "", err
+			}
+
 			fmt.Println("[INFO] Uploading control-plane certificates...")
 
 			certs := exec.Command("sudo", strings.Fields(certsCmd)...)
@@ -1771,6 +1789,16 @@ func generateJoinCommand(
 		output = out
 
 		if controlPlane {
+			ready, _ := sudoRun(client, password, readyCmd)
+
+			run := func(script string) (string, error) {
+				return sudoRun(client, password, script)
+			}
+
+			if err := planControlPlanes(reader, ready, run); err != nil {
+				return "", err
+			}
+
 			fmt.Println("[INFO] Uploading control-plane certificates...")
 
 			out, err := sudoRun(client, password, certsCmd)
@@ -1796,6 +1824,246 @@ func generateJoinCommand(
 	}
 
 	return join + " --control-plane --certificate-key " + key, nil
+}
+
+// controlPlaneStates reads "name=ReadyStatus" lines into the control planes
+// that are up and those that are down, plus "@self=<hostname>" (the machine
+// the commands run on). Lines it cannot read are skipped.
+func controlPlaneStates(output string) (self string, up, down []string) {
+
+	for _, line := range strings.Split(output, "\n") {
+		name, status, ok := strings.Cut(strings.TrimSpace(line), "=")
+
+		switch {
+		case ok && name == "@self":
+			self = status
+		case !ok || !nodeNamePattern.MatchString(name):
+		case status == "True":
+			up = append(up, name)
+		default:
+			down = append(down, name)
+		}
+	}
+
+	return self, up, down
+}
+
+var nodeNamePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+
+// removeControlPlaneScript removes control plane node from etcd and from
+// the cluster, running etcdctl in the etcd pod of control plane via. A node
+// that is up is drained first. A node reported down whose etcd still
+// answers is left alone: it is not what blocks a join then.
+func removeControlPlaneScript(node, via string, up bool) string {
+
+	vars := "node=" + shellQuote(node) + " via=" + shellQuote(via) + " up=0\n"
+
+	if up {
+		vars = strings.Replace(vars, "up=0", "up=1", 1)
+	}
+
+	return vars + `set -e
+export KUBECONFIG=/etc/kubernetes/admin.conf
+c="--cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key"
+ip=$(kubectl get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+[ -n "$ip" ] || { echo "No address known for $node."; exit 1; }
+if [ "$up" = 1 ]; then
+	kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --timeout=180s ||
+		echo "Some pods did not leave $node; removing it anyway."
+elif kubectl -n kube-system exec "etcd-$via" -- etcdctl --endpoints="https://$ip:2379" $c endpoint health --command-timeout=5s >/dev/null 2>&1; then
+	echo "etcd on $node still answers; leaving $node in place."
+	exit 0
+fi
+list=$(kubectl -n kube-system exec "etcd-$via" -- etcdctl --endpoints=https://127.0.0.1:2379 $c member list)
+id=$(printf '%s\n' "$list" | awk -F', ' -v u="https://$ip:2380" '$4 == u {print $1}')
+if [ -n "$id" ]; then
+	kubectl -n kube-system exec "etcd-$via" -- etcdctl --endpoints=https://127.0.0.1:2379 $c member remove "$id"
+fi
+kubectl delete node "$node" --wait=false
+echo "$node removed from etcd and the cluster."`
+}
+
+// readChoice asks until the answer is one of 1..max; blank (or end of
+// input) is def.
+func readChoice(reader *bufio.Reader, prompt string, def, max int) int {
+
+	for {
+		answer := strings.TrimSpace(readRemoteValue(reader, prompt))
+
+		if answer == "" {
+			return def
+		}
+
+		if n, err := strconv.Atoi(answer); err == nil && n >= 1 && n <= max {
+			return n
+		}
+	}
+}
+
+// etcdCanLose is how many of n etcd members can be down while it keeps
+// working: it needs more than half of them.
+func etcdCanLose(n int) int { return (n - 1) / 2 }
+
+// planControlPlanes runs before a control plane joins. It shows how many
+// control planes the cluster has and what one more means for etcd, and lets
+// the user add it, replace one (keeping the count) or cancel. A control
+// plane that is down must be replaced first: etcd refuses to add a member
+// while one of its members is unreachable. output is the "name=ReadyStatus"
+// list; run executes a script as root on the control plane it came from.
+func planControlPlanes(
+	reader *bufio.Reader,
+	output string,
+	run func(script string) (string, error),
+) error {
+
+	self, up, down := controlPlaneStates(output)
+	total := len(up) + len(down)
+
+	if total == 0 {
+		return nil // could not read the control planes; the join reports problems
+	}
+
+	if len(up)*2 <= total {
+		return fmt.Errorf(
+			"only %d of %d control planes are up (%s down); etcd needs more than "+
+				"half of them to make any change. Start one of them again first",
+			len(up), total, strings.Join(down, ", "),
+		)
+	}
+
+	// etcdctl runs in the etcd pod of the machine the commands run on when
+	// it is a control plane that is up; that one is never offered for removal.
+	via := up[0]
+	var candidates []string
+
+	for _, name := range up {
+		if name == self {
+			via = self
+		} else {
+			candidates = append(candidates, name)
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("This cluster has %d control plane(s): %s", total, strings.Join(up, ", "))
+
+	if len(down) > 0 {
+		fmt.Printf(" (DOWN: %s)", strings.Join(down, ", "))
+	}
+
+	fmt.Println(".")
+
+	remove := func(node string, isUp bool) error {
+		fmt.Printf("[INFO] Removing %s from etcd and the cluster...\n", node)
+
+		out, err := run(removeControlPlaneScript(node, via, isUp))
+
+		if out != "" {
+			fmt.Println(out)
+		}
+
+		if err != nil {
+			return fmt.Errorf("removing %s: %v", node, err)
+		}
+
+		if isUp {
+			fmt.Printf("[INFO] On %s, run now: sudo kubeadm reset -f\n", node)
+			fmt.Printf("       (or add it back later; the installer resets it first).\n")
+		}
+
+		fmt.Println()
+
+		return nil
+	}
+
+	if len(down) > 0 {
+		names := strings.Join(down, ", ")
+
+		fmt.Printf("etcd will not add a new control plane while %s is unreachable.\n", names)
+		fmt.Printf("  1) Replace %s with this machine, staying at %d (%s can be added\n", names, total, names)
+		fmt.Println("     back later as a control plane; the installer resets it first)")
+		fmt.Printf("  2) Cancel (start %s again, then add this one)\n", names)
+
+		if readChoice(reader, "Choice [2]: ", 2, 2) != 1 {
+			return fmt.Errorf("cancelled; nothing was changed")
+		}
+
+		for _, node := range down {
+			if err := remove(node, false); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	after := total + 1
+
+	if total == 1 {
+		fmt.Println("Adding this one makes 2. etcd needs more than half of its members up, so with")
+		fmt.Println("2 losing EITHER one stops the cluster: less safe than 1. 3 can lose one.")
+		fmt.Println("The only control plane cannot be swapped out (its etcd holds the cluster).")
+		fmt.Println("  1) Add it, making 2 (a third control plane will follow)")
+		fmt.Println("  2) Cancel (to stay at 1, add this machine as a worker instead)")
+
+		if readChoice(reader, "Choice [2]: ", 2, 2) != 1 {
+			return fmt.Errorf("cancelled; the cluster stays at 1 control plane")
+		}
+
+		return nil
+	}
+
+	fmt.Printf("%d control planes can lose %d; adding this one makes %d, which can lose %d.\n",
+		total, etcdCanLose(total), after, etcdCanLose(after))
+
+	def := 1
+
+	if after%2 == 0 {
+		def = 3
+		fmt.Printf("[WARN] An even number adds no safety: %d can lose %d, the same as %d,\n",
+			after, etcdCanLose(after), total)
+		fmt.Println("       and etcd has one more member to wait for.")
+	}
+
+	fmt.Printf("  1) Add it, making %d\n", after)
+	fmt.Printf("  2) Replace one of them with this machine, staying at %d\n", total)
+	fmt.Println("  3) Cancel")
+
+	switch readChoice(reader, fmt.Sprintf("Choice [%d]: ", def), def, 3) {
+	case 1:
+		return nil
+	case 3:
+		return fmt.Errorf("cancelled; the cluster stays at %d control planes", total)
+	}
+
+	if len(candidates) == 0 {
+		return fmt.Errorf("no control plane can be replaced from here")
+	}
+
+	for i, name := range candidates {
+		fmt.Printf("  %d) %s\n", i+1, name)
+	}
+
+	pick := readChoice(reader, "Control plane to replace (blank = cancel): ", 0, len(candidates))
+
+	if pick == 0 {
+		return fmt.Errorf("cancelled; nothing was changed")
+	}
+
+	node := candidates[pick-1]
+
+	fmt.Printf("%s will be drained (its pods move to other nodes) and removed from etcd\n", node)
+	fmt.Println("and the cluster before this machine joins.")
+
+	confirm := strings.ToLower(strings.TrimSpace(readRemoteValue(
+		reader, fmt.Sprintf("Replace %s? [y/N]: ", node),
+	)))
+
+	if confirm != "y" && confirm != "yes" {
+		return fmt.Errorf("cancelled; nothing was changed")
+	}
+
+	return remove(node, true)
 }
 
 var certificateKeyPattern = regexp.MustCompile(`(?m)^\s*([a-f0-9]{64})\s*$`)
