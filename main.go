@@ -115,6 +115,22 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Clean Up Stuck Pods",
+		Desc:  "Removes pods stuck Terminating on a node that is down (they block Jobs and CronJobs) and failed/evicted pods left behind. Shows the list and asks first. The pod-cleanup app also does this every 2 minutes; this makes Argo CD stop waiting on DaemonSet pods of nodes that are down too.",
+		Op:    "pod-cleanup",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run pod-cleanup",
+		},
+	},
+	{
+		Title: "Decommission Node",
+		Desc:  "Take a worker or control plane out of the cluster for good. Up: Longhorn moves its volume copies, its pods are drained, a control plane leaves etcd, and the machine is reset. Down: its pods are force-removed and a control plane leaves etcd. Then it is deleted from Kubernetes and Longhorn. Checks etcd quorum and asks you to type the node name.",
+		Op:    "decommission",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run decommission",
+		},
+	},
+	{
 		Title: "Import Docker Compose App",
 		Desc:  "Turn a docker-compose.yml into an app in your GitOps repo (apps/applications/<name>): web UIs get https://<name>.<domain>, LAN services a MetalLB IP, volumes go on Longhorn and passwords into a cluster Secret. Then it deploys and waits until it's healthy.",
 		Op:    "compose-import",
