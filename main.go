@@ -131,6 +131,14 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Turn Services On/Off",
+		Desc:  "Stop or start optional apps (qBittorrent, PostgreSQL, the AI apps such as Hermes, databases and imported apps) without changing git. Off: Argo CD pauses the app and its pods scale to 0; volumes, Secrets and settings are kept. On: it starts again as before. Core apps like Longhorn and ingress are not listed.",
+		Op:    "services",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run services",
+		},
+	},
+	{
 		Title: "Import Docker Compose App",
 		Desc:  "Turn a docker-compose.yml into an app in your GitOps repo (apps/applications/<name>): web UIs get https://<name>.<domain>, LAN services a MetalLB IP, volumes go on Longhorn and passwords into a cluster Secret. Then it deploys and waits until it's healthy.",
 		Op:    "compose-import",
