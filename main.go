@@ -139,6 +139,14 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Change Web UI Login",
+		Desc:  "Change the username and/or password of a web UI: Argo CD and Rancher (password; their usernames are fixed), Hermes, pgAdmin and qBittorrent. Blank password = a random one, shown once. Passwords are never written to git or a file.",
+		Op:    "web-logins",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run web-logins",
+		},
+	},
+	{
 		Title: "Import Docker Compose App",
 		Desc:  "Turn a docker-compose.yml into an app in your GitOps repo (apps/applications/<name>): web UIs get https://<name>.<domain>, LAN services a MetalLB IP, volumes go on Longhorn and passwords into a cluster Secret. Then it deploys and waits until it's healthy.",
 		Op:    "compose-import",
