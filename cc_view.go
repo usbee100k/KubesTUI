@@ -282,6 +282,8 @@ func (c *commandCenter) setFooter() {
 			extra = "    [aqua::b]L[-::-] Logs    [aqua::b]X[-::-] Restart pod"
 		case "Node":
 			extra = "    [aqua::b]C[-::-] Cordon/uncordon"
+		case "App":
+			extra = "    [aqua::b]Y[-::-] Sync"
 		case "Device":
 			extra = "    [aqua::b]K[-::-] Mark known"
 		}
@@ -505,6 +507,8 @@ func (c *commandCenter) titleInfo(p ccPanelID) string {
 		return strings.Join(parts, " ")
 	case pNamespaces:
 		return "[gray]sort[-] " + nsSorts[c.nsSort]
+	case pApps:
+		return "[aqua::b]Y[-::-] [gray]sync[-]  [aqua::b]A[-::-] [gray]sync all out of sync[-]"
 	case pStorage:
 		hints := []string{}
 		if c.onFiles != nil {
@@ -1558,6 +1562,84 @@ func (c *commandCenter) toggleCordon(name string) {
 		verb+"ed "+name+".")
 }
 
+// appSyncBody starts an Argo CD sync the way the argocd CLI does (an
+// operation on the Application), after a hard refresh so it compares
+// against the latest commit in git.
+const appSyncBody = `{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}},` +
+	`"operation":{"initiatedBy":{"username":"kubestui"},"info":[{"name":"Reason","value":"Sync from KubesTUI"}],` +
+	`"sync":{"syncStrategy":{"hook":{}}}}}`
+
+func appSyncRequest(a ccApp) ccRequest {
+	return ccRequest{Method: http.MethodPatch,
+		Path: "/apis/argoproj.io/v1alpha1/namespaces/" + url.PathEscape(a.NS) + "/applications/" + url.PathEscape(a.Name),
+		Body: appSyncBody, ContentType: "application/merge-patch+json",
+		Kubectl: []string{"patch", "applications.argoproj.io", "-n", a.NS, a.Name, "--type", "merge", "-p", appSyncBody}}
+}
+
+// syncApps asks, then syncs the named Argo CD apps. Apps already syncing
+// are left alone.
+func (c *commandCenter) syncApps(names []string) {
+	if why := c.actionsBlocked(); why != "" {
+		c.flash("[yellow]" + tview.Escape(why) + "[-]")
+		return
+	}
+	var apps []ccApp
+	busy := 0
+	for _, n := range names {
+		for _, a := range c.snap.Apps {
+			if a.Name == n {
+				if a.Phase == "Running" {
+					busy++
+				} else {
+					apps = append(apps, a)
+				}
+			}
+		}
+	}
+	if len(apps) == 0 {
+		c.flash("[yellow]Already syncing; wait for it to finish.[-]")
+		return
+	}
+	title, question := "SYNC APP", "Sync "+apps[0].Name+" now?\n\nArgo CD fetches the latest commit from git and applies it."
+	if len(apps) > 1 {
+		list := make([]string, len(apps))
+		for i, a := range apps {
+			list[i] = a.Name
+		}
+		title = "SYNC APPS"
+		question = fmt.Sprintf("Sync these %d apps now?\n\n%s\n\nArgo CD fetches the latest commit from git and applies it.", len(apps), strings.Join(list, ", "))
+	}
+	if busy > 0 {
+		question += fmt.Sprintf("\n\n(%d already syncing, left alone.)", busy)
+	}
+	src := c.src
+	showConfirm(title, question, "Sync", "Cancel", func(ok bool) {
+		if !ok {
+			return
+		}
+		c.app.SetFocus(c)
+		go func() {
+			var failed []string
+			for _, a := range apps {
+				if err := src.Do(appSyncRequest(a)); err != nil {
+					failed = append(failed, a.Name+": "+err.Error())
+				}
+			}
+			c.app.QueueUpdateDraw(func() {
+				switch {
+				case len(failed) > 0:
+					c.flash("[red]" + tview.Escape(strings.Join(failed, "; ")) + "[-]")
+				case len(apps) == 1:
+					c.flash("[green]Syncing " + tview.Escape(apps[0].Name) + ".[-]")
+				default:
+					c.flash(fmt.Sprintf("[green]Syncing %d apps.[-]", len(apps)))
+				}
+				c.refreshNow()
+			})
+		}()
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Keys and mouse
 // ---------------------------------------------------------------------------
@@ -1609,6 +1691,10 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			case 'c', 'C':
 				if o.target.Kind == "Node" {
 					c.toggleCordon(o.target.Name)
+				}
+			case 'y', 'Y':
+				if o.target.Kind == "App" {
+					c.syncApps([]string{o.target.Name})
 				}
 			case 'k', 'K':
 				if o.target.Kind == "Device" && c.net != nil {
@@ -1763,6 +1849,22 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			c.dnsConnect()
 		case (r == 'a' || r == 'A') && c.dnsPage():
 			c.dnsFix()
+		case (r == 'y' || r == 'Y') && c.focus == pApps:
+			if name := c.selected(pApps); name != "" {
+				c.syncApps([]string{name})
+			}
+		case (r == 'a' || r == 'A') && c.focus == pApps && c.snap != nil:
+			var names []string
+			for _, a := range c.snap.Apps {
+				if a.Sync != "Synced" {
+					names = append(names, a.Name)
+				}
+			}
+			if len(names) == 0 {
+				c.flash("[green]Every app is in sync.[-]")
+				break
+			}
+			c.syncApps(names)
 		case r == 'c' || r == 'C':
 			if c.focus == pNodes && c.snap != nil {
 				if name := c.selected(pNodes); name != "" {
@@ -2146,7 +2248,7 @@ func (c *commandCenter) appDetail(name string, w int) []string {
 			l = append(l, fmt.Sprintf("  [%s]●[-] %s %6s %6s [%s]%s[-]", podColor(&p), tview.Escape(fit(p.Name, max(20, w-40), false)),
 				fmtCPU(p.CPUUse), fmtBytes(p.MemUse), podColor(&p), tview.Escape(p.Status)))
 		}
-		l = append(l, "", "[gray]Sync or change it in the Argo CD web UI, or push to your GitOps repo.[-]")
+		l = append(l, "", "[gray]Y syncs it now (fresh from git). Change it in your GitOps repo.[-]")
 		return l
 	}
 	return []string{"[yellow]App " + tview.Escape(name) + " is gone.[-]"}

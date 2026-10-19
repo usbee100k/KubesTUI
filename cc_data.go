@@ -178,7 +178,7 @@ type ccIngress struct {
 }
 
 type ccApp struct {
-	Name, Dest, Sync, Health, Phase, Message, Repo, Path, Revision string
+	Name, NS, Dest, Sync, Health, Phase, Message, Repo, Path, Revision string
 }
 
 type ccEvent struct {
@@ -1162,7 +1162,7 @@ func parseCCApps(data []byte) []ccApp {
 	var out []ccApp
 	for _, it := range list.Items {
 		a := ccApp{
-			Name: it.Metadata.Name, Dest: it.Spec.Destination.Namespace,
+			Name: it.Metadata.Name, NS: orDefault(it.Metadata.Namespace, "argocd"), Dest: it.Spec.Destination.Namespace,
 			Sync: orDefault(it.Status.Sync.Status, "Unknown"), Health: orDefault(it.Status.Health.Status, "Unknown"),
 			Revision: it.Status.Sync.Revision, Message: it.Status.Health.Message,
 		}

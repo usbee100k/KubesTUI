@@ -129,6 +129,8 @@ func (d *demoCCSource) Do(r ccRequest) error {
 		name := strings.TrimPrefix(r.Path, "/api/v1/nodes/")
 		d.cordon[name] = strings.Contains(r.Body, "true")
 		return nil
+	case r.Method == http.MethodPatch && strings.Contains(r.Path, "/applications/"):
+		return nil // the demo apps stay as they are
 	}
 	return errors.New("not available in the demo")
 }
