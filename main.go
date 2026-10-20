@@ -139,6 +139,14 @@ var operations = []operation{
 		},
 	},
 	{
+		Title: "Hermes Local LLM",
+		Desc:  "Let Hermes use an LLM server on a machine in your LAN (Ollama, LM Studio or llama.cpp, e.g. your gaming PC), change its IP, or turn it off. Its network policy blocks the rest of the LAN. Saves hermes.localLLM in config/cluster.yaml and pushes only Hermes's files.",
+		Op:    "hermes-llm",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run hermes-llm",
+		},
+	},
+	{
 		Title: "Change Web UI Login",
 		Desc:  "Change the username and/or password of a web UI: Argo CD and Rancher (password; their usernames are fixed), Hermes, pgAdmin and qBittorrent. Blank password = a random one, shown once. Passwords are never written to git or a file.",
 		Op:    "web-logins",
