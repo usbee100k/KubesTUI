@@ -2569,6 +2569,10 @@ func main() {
 		app.SetFocus(list)
 	}
 
+	helpPg = newHelpScreen(app, pages, footer)
+	bySection[secHelp] = helpMenuItems(backToMain)
+	menu.setSections(sectionsFrom(bySection))
+
 	ccPage = newCommandCenter(app, pages, footer)
 	ccPage.actionsBlocked = func() string {
 		if dryRun {
@@ -2624,6 +2628,10 @@ func main() {
 			return ccPage.HandleKey(ev)
 		case "cclogs":
 			return ccPage.logs.HandleKey(ev)
+		case "help":
+			return helpPg.HandleKey(ev)
+		case "helpindex":
+			return helpPg.HandleIndexKey(ev)
 		case "sshform", "rjform", "ask":
 			return ev // the form handles its own keys; ESC cancels it
 		}

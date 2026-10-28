@@ -1,7 +1,7 @@
 package main
 
 // Sectioned main menu: a row of section tabs (Command Center, Cluster,
-// VPN, Update, Remote Join, Bootstrappers) above a list that shows the
+// VPN, Update, Remote Join, Bootstrappers, Help) above a list that shows the
 // current section's items. LEFT/RIGHT or 1-9 switch sections; tabs can be
 // clicked. Used by the node menu (kbtui) and the workstation cluster page.
 
@@ -30,9 +30,10 @@ const (
 	secUpdate        = "Update"
 	secRemoteJoin    = "Remote Join"
 	secBootstrappers = "Bootstrappers"
+	secHelp          = "Help"
 )
 
-var menuSectionOrder = []string{secCommandCenter, secCluster, secVPN, secUpdate, secRemoteJoin, secBootstrappers}
+var menuSectionOrder = []string{secCommandCenter, secCluster, secVPN, secUpdate, secRemoteJoin, secBootstrappers, secHelp}
 
 // tabBar draws the section tabs and a rule under them (2 rows).
 type tabBar struct {
@@ -146,6 +147,14 @@ func newTabbedMenu(list *tview.List, showDesc bool) *tabbedMenu {
 				m.show(int(r - '1'))
 				return nil
 			}
+			if ev.Rune() == '?' {
+				for i, s := range m.sections {
+					if s.name == secHelp {
+						m.show(i)
+						return nil
+					}
+				}
+			}
 		}
 		return ev
 	})
@@ -210,7 +219,7 @@ func sectionsFrom(bySection map[string][]menuItem) []menuSection {
 
 // menuFooter is the footer for a sectioned menu.
 func menuFooter(extra string) string {
-	return " [aqua::b]←/→[-::-] Section    [aqua::b]↑/↓[-::-] Navigate    [aqua::b]ENTER[-::-] Select" + extra + "    [aqua::b]Q[-::-] Quit"
+	return " [aqua::b]←/→[-::-] Section    [aqua::b]↑/↓[-::-] Navigate    [aqua::b]ENTER[-::-] Select" + extra + "    [aqua::b]?[-::-] Help    [aqua::b]Q[-::-] Quit"
 }
 
 // opSection says which section of the node menu an operation belongs to.

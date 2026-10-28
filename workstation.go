@@ -91,6 +91,7 @@ func setupWorkstation(app *tview.Application) *workstation {
 
 	termPage = newTermScreen(app, w.pages, w.footer)
 	ccPage = newCommandCenter(app, w.pages, w.footer)
+	helpPg = newHelpScreen(app, w.pages, w.footer)
 	sshPage = newSSHConsole(app, w.pages, w.footer, w.showCluster)
 	sshPage.nodesFn = func() ([]nodeRow, error) {
 		if p := w.current; p != nil {
@@ -141,6 +142,10 @@ func (w *workstation) capture(ev *tcell.EventKey) *tcell.EventKey {
 		return ccPage.HandleKey(ev)
 	case "cclogs":
 		return ccPage.logs.HandleKey(ev)
+	case "help":
+		return helpPg.HandleKey(ev)
+	case "helpindex":
+		return helpPg.HandleIndexKey(ev)
 	case "ask", "pair", "sshform", "rjform", "vpnimport", "composeform", "machineform":
 		return ev
 	case "pairlog":
@@ -166,6 +171,9 @@ func (w *workstation) capture(ev *tcell.EventKey) *tcell.EventKey {
 				return nil
 			case 'd', 'D':
 				w.removeSelected()
+				return nil
+			case '?':
+				helpPg.openIndex(w.showHome, false)
 				return nil
 			case 'q', 'Q':
 				w.app.Stop()
@@ -281,7 +289,7 @@ func (w *workstation) showHome() {
 	}
 
 	w.pages.AddAndSwitchToPage("home", w.home, true)
-	w.footer.SetText(" [aqua::b]ENTER[-::-] Open    [aqua::b]N[-::-] New cluster    [aqua::b]D[-::-] Remove    [aqua::b]Q[-::-] Quit")
+	w.footer.SetText(" [aqua::b]ENTER[-::-] Open    [aqua::b]N[-::-] New cluster    [aqua::b]D[-::-] Remove    [aqua::b]?[-::-] Help    [aqua::b]Q[-::-] Quit")
 	w.app.SetFocus(w.homeTable)
 }
 
@@ -617,7 +625,12 @@ func (c *clusterBody) Draw(screen tcell.Screen) {
 // actions lists the cluster page's items by section.
 func (w *workstation) actions() map[string][]wsAction {
 	host := w.current.Host
+	var help []wsAction
+	for _, it := range helpMenuItems(w.showCluster) {
+		help = append(help, wsAction{title: it.title, desc: it.desc, run: it.run})
+	}
 	return map[string][]wsAction{
+		secHelp: help,
 		secCommandCenter: {
 			{title: "Command Center", desc: "Live view of everything: nodes, IPs, CPU/memory/disk/network, pods, namespaces, Argo CD apps, LAN IPs, storage and alerts", run: w.openCommandCenter},
 			{title: "Open Shell on Control Plane", desc: "A terminal on " + host, run: w.openShell},
