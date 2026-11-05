@@ -13,7 +13,7 @@ package main
 //
 // The layout adapts to the terminal: three columns when wide, panels share
 // a tabbed box when it isn't. ENTER opens details (live), L shows a pod's
-// logs, X restarts a pod, C cordons a node.
+// logs, X restarts a pod, D deletes one for good, C cordons a node.
 
 import (
 	"fmt"
@@ -279,7 +279,7 @@ func (c *commandCenter) setFooter() {
 		extra := ""
 		switch c.overlay.target.Kind {
 		case "Pod":
-			extra = "    [aqua::b]L[-::-] Logs    [aqua::b]X[-::-] Restart pod"
+			extra = "    [aqua::b]L[-::-] Logs    [aqua::b]X[-::-] Restart pod    [aqua::b]D[-::-] Delete pod"
 		case "Node":
 			extra = "    [aqua::b]C[-::-] Cordon/uncordon"
 		case "App":
@@ -1509,6 +1509,12 @@ func (c *commandCenter) closeOverlay() {
 
 // act runs a change after confirmation, then refreshes.
 func (c *commandCenter) act(title, question, button string, r ccRequest, done string) {
+	c.actAll(title, question, button, []ccRequest{r}, done)
+}
+
+// actAll is act for several requests, run in order; one for something
+// already gone ("not found") doesn't stop the rest.
+func (c *commandCenter) actAll(title, question, button string, rs []ccRequest, done string) {
 	if why := c.actionsBlocked(); why != "" {
 		c.flash("[yellow]" + tview.Escape(why) + "[-]")
 		return
@@ -1520,7 +1526,13 @@ func (c *commandCenter) act(title, question, button string, r ccRequest, done st
 		}
 		c.app.SetFocus(c)
 		go func() {
-			err := src.Do(r)
+			var err error
+			for _, r := range rs {
+				if err = src.Do(r); err != nil && !strings.Contains(strings.ToLower(err.Error()), "not found") {
+					break
+				}
+				err = nil
+			}
 			c.app.QueueUpdateDraw(func() {
 				if err != nil {
 					c.flash("[red]" + tview.Escape(err.Error()) + "[-]")
@@ -1540,6 +1552,58 @@ func (c *commandCenter) restartPod(ns, name string) {
 		ccRequest{Method: http.MethodDelete, Path: "/api/v1/namespaces/" + url.PathEscape(ns) + "/pods/" + url.PathEscape(name),
 			Kubectl: []string{"delete", "pod", "-n", ns, name, "--wait=false"}},
 		"Deleted "+ns+"/"+name+"; a new pod is starting.")
+}
+
+// deletePod removes a pod for good. A pod a Job runs goes with its Job
+// (the Job would start another one). On a node that is down, or when the
+// pod is already stuck Terminating, it is force-deleted: there is no
+// kubelet to confirm it stopped. A pod a Deployment, StatefulSet or
+// DaemonSet runs comes back, which the question says.
+func (c *commandCenter) deletePod(ns, name string) {
+	podPath := "/api/v1/namespaces/" + url.PathEscape(ns) + "/pods/" + url.PathEscape(name)
+	kind, owner := "", ""
+	force := false
+	nodeNote := ""
+	if p := c.snap.pod(ns, name); p != nil {
+		kind, owner, _ = strings.Cut(p.Owner, "/")
+		force = p.Status == "Terminating"
+		if n := c.snap.node(p.Node); p.Node != "" && (n == nil || !n.Ready) {
+			force = true
+			nodeNote = "\n\nIts node " + p.Node + " is down, so it is removed without waiting for that node to confirm; if the node comes back, its kubelet stops the container then."
+		} else if force {
+			nodeNote = "\n\nIt's stuck Terminating, so it is removed without waiting any longer."
+		}
+	}
+
+	del := ccRequest{Method: http.MethodDelete, Path: podPath,
+		Kubectl: []string{"delete", "pod", "-n", ns, name, "--wait=false"}}
+	if force {
+		del.Body, del.ContentType = `{"gracePeriodSeconds":0}`, "application/json"
+		del.Kubectl = []string{"delete", "pod", "-n", ns, name, "--grace-period=0", "--force", "--wait=false"}
+	}
+
+	reqs := []ccRequest{del}
+	question := fmt.Sprintf("Delete pod %s/%s for good?\n\nNothing manages it, so it doesn't come back.", ns, name)
+	done := "Deleted " + ns + "/" + name + "."
+	switch kind {
+	case "Job":
+		// The Job first, or it starts a new pod.
+		reqs = []ccRequest{{Method: http.MethodDelete,
+			Path:        "/apis/batch/v1/namespaces/" + url.PathEscape(ns) + "/jobs/" + url.PathEscape(owner),
+			Body:        `{"propagationPolicy":"Background"}`,
+			ContentType: "application/json",
+			Kubectl:     []string{"delete", "job", "-n", ns, owner, "--cascade=background", "--wait=false"}}, del}
+		question = fmt.Sprintf("Delete pod %s/%s and its Job %s?\n\nThe Job goes too, so nothing starts the pod again. (If a CronJob made the Job, it runs again at its next scheduled time.)", ns, name, owner)
+		done = "Deleted " + ns + "/" + name + " and Job " + owner + "."
+	case "ReplicaSet", "StatefulSet", "DaemonSet":
+		what := kind + " " + owner
+		if kind == "ReplicaSet" {
+			what = "a Deployment (ReplicaSet " + owner + ")"
+		}
+		question = fmt.Sprintf("Delete pod %s/%s?\n\nIt belongs to %s, which starts a new one right away. To keep it stopped, turn the app off instead (Cluster > Turn Services On/Off) or scale it to 0.", ns, name, what)
+		done = "Deleted " + ns + "/" + name + "; its " + kind + " starts a new one."
+	}
+	c.actAll("DELETE POD", question+nodeNote, "Delete", reqs, done)
 }
 
 func (c *commandCenter) toggleCordon(name string) {
@@ -1687,6 +1751,10 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			case 'x', 'X':
 				if o.target.Kind == "Pod" {
 					c.restartPod(o.target.NS, o.target.Name)
+				}
+			case 'd', 'D':
+				if o.target.Kind == "Pod" {
+					c.deletePod(o.target.NS, o.target.Name)
 				}
 			case 'c', 'C':
 				if o.target.Kind == "Node" {
@@ -1843,6 +1911,12 @@ func (c *commandCenter) HandleKey(ev *tcell.EventKey) *tcell.EventKey {
 			if c.focus == pPods {
 				if ns, name, ok := strings.Cut(c.selected(pPods), "/"); ok {
 					c.restartPod(ns, name)
+				}
+			}
+		case r == 'd' || r == 'D':
+			if c.focus == pPods {
+				if ns, name, ok := strings.Cut(c.selected(pPods), "/"); ok {
+					c.deletePod(ns, name)
 				}
 			}
 		case (r == 'c' || r == 'C') && c.dnsPage():
@@ -2176,7 +2250,7 @@ func (c *commandCenter) podDetail(ns, name string, w int) []string {
 			l = append(l, wrapIndented(e, w)...)
 		}
 	}
-	l = append(l, "", "[gray]L logs · X restart (delete; its controller starts a new one) · ESC close[-]")
+	l = append(l, "", "[gray]L logs · X restart (delete; its controller starts a new one) · D delete for good (a Job's pod: with its Job) · ESC close[-]")
 	return l
 }
 

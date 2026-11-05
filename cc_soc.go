@@ -1072,7 +1072,7 @@ func (c *commandCenter) socDetail(key string, w int) []string {
 	switch f.Target.Kind {
 	case "Pod":
 		if c.snap.pod(f.Target.NS, f.Target.Name) != nil {
-			l = append(l, "", section("LIVE: POD "+f.Target.NS+"/"+f.Target.Name), "[gray]L logs · X restart[-]")
+			l = append(l, "", section("LIVE: POD "+f.Target.NS+"/"+f.Target.Name), "[gray]L logs · X restart · D delete[-]")
 			l = append(l, c.podDetail(f.Target.NS, f.Target.Name, w)...)
 		}
 	case "Node":

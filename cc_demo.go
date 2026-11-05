@@ -121,6 +121,8 @@ func (d *demoCCSource) Do(r ccRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
+	case r.Method == http.MethodDelete && strings.Contains(r.Path, "/jobs/"):
+		return nil // the demo has no Jobs to remove
 	case r.Method == http.MethodDelete && strings.Contains(r.Path, "/pods/"):
 		parts := strings.Split(r.Path, "/")
 		d.deleted[parts[len(parts)-1]] = time.Now()
