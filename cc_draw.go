@@ -243,24 +243,25 @@ func (r ccRect) contains(x, y int) bool {
 
 func (r ccRect) inner() ccRect { return ccRect{r.x + 1, r.y + 1, r.w - 2, r.h - 2} }
 
-// drawBox draws a rounded box in color.
+// drawBox draws a box in color, in the same lines as every other border.
 func drawBox(screen tcell.Screen, r ccRect, color tcell.Color) {
 	if r.w < 2 || r.h < 2 {
 		return
 	}
 	st := tcell.StyleDefault.Foreground(color).Background(tview.Styles.PrimitiveBackgroundColor)
+	l := lines()
 	for x := r.x + 1; x < r.x+r.w-1; x++ {
-		screen.SetContent(x, r.y, '─', nil, st)
-		screen.SetContent(x, r.y+r.h-1, '─', nil, st)
+		screen.SetContent(x, r.y, l.h, nil, st)
+		screen.SetContent(x, r.y+r.h-1, l.h, nil, st)
 	}
 	for y := r.y + 1; y < r.y+r.h-1; y++ {
-		screen.SetContent(r.x, y, '│', nil, st)
-		screen.SetContent(r.x+r.w-1, y, '│', nil, st)
+		screen.SetContent(r.x, y, l.v, nil, st)
+		screen.SetContent(r.x+r.w-1, y, l.v, nil, st)
 	}
-	screen.SetContent(r.x, r.y, '╭', nil, st)
-	screen.SetContent(r.x+r.w-1, r.y, '╮', nil, st)
-	screen.SetContent(r.x, r.y+r.h-1, '╰', nil, st)
-	screen.SetContent(r.x+r.w-1, r.y+r.h-1, '╯', nil, st)
+	screen.SetContent(r.x, r.y, l.tl, nil, st)
+	screen.SetContent(r.x+r.w-1, r.y, l.tr, nil, st)
+	screen.SetContent(r.x, r.y+r.h-1, l.bl, nil, st)
+	screen.SetContent(r.x+r.w-1, r.y+r.h-1, l.br, nil, st)
 }
 
 // clearRect blanks an area (under an overlay).

@@ -230,7 +230,7 @@ func (w *workstation) buildHome() {
 
 	w.homeNote = tview.NewTextView().SetDynamicColors(true)
 
-	body := frame("HOMELAB KUBERNETES PLATFORM")
+	body := frame(dashboardTitle)
 	body.AddItem(intro, 5, 0, false).
 		AddItem(w.homeTable, 0, 1, true).
 		AddItem(w.homeNote, 2, 0, false)
@@ -566,7 +566,7 @@ func (w *workstation) buildCluster() {
 
 	w.menu = newTabbedMenu(w.clusterList, true)
 
-	body := &clusterBody{Flex: frame("HOMELAB KUBERNETES PLATFORM"), top: tview.NewFlex(),
+	body := &clusterBody{Flex: frame(dashboardTitle), top: tview.NewFlex(),
 		info: w.clusterInfo, lights: w.activity.view, lines: 2}
 	body.AddItem(nil, 1, 0, false).
 		AddItem(body.top, 7, 0, false).

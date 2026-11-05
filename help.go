@@ -712,7 +712,7 @@ func newHelpScreen(app *tview.Application, pages *tview.Pages, footer *tview.Tex
 		SetLabel(" Search: ").
 		SetLabelColor(tcell.ColorYellow).
 		SetPlaceholder("type words, e.g. longhorn disk").
-		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
+		SetFieldBackgroundColor(panelColor).
 		SetChangedFunc(func(string) { h.refreshIndex() })
 	h.list = tview.NewList().
 		ShowSecondaryText(true).

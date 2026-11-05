@@ -78,7 +78,7 @@ func (t *tabBar) Draw(screen tcell.Screen) {
 	cx := x + 2
 	for i := range t.names {
 		l := label(i, form)
-		style := tcell.StyleDefault.Foreground(tcell.ColorAqua)
+		style := uiStyle().Foreground(tcell.ColorAqua)
 		if i == t.cur {
 			style = tcell.StyleDefault.Background(tcell.ColorAqua).Foreground(tcell.ColorBlack).Bold(true)
 		}
@@ -94,9 +94,9 @@ func (t *tabBar) Draw(screen tcell.Screen) {
 		cx++
 	}
 	if h > 1 {
-		rule := tcell.StyleDefault.Foreground(tcell.ColorDarkSlateGray)
+		rule := uiStyle().Foreground(borderColor)
 		for i := x + 1; i < x+w-1; i++ {
-			screen.SetContent(i, y+1, '─', nil, rule)
+			screen.SetContent(i, y+1, lines().h, nil, rule)
 		}
 	}
 }

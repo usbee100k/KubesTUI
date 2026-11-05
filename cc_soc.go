@@ -691,8 +691,9 @@ func (c *commandCenter) socScroll(k tcell.Key) bool {
 // ---------------------------------------------------------------------------
 
 func socTitle(screen tcell.Screen, r ccRect, title string) {
-	drawBox(screen, r, tcell.NewRGBColor(0x2e, 0x5f, 0x8a))
-	put(screen, "┤[#48dbfb::b]"+title+"[-::-]├", r.x+2, r.y, r.w-4)
+	color := tcell.NewRGBColor(0x2e, 0x5f, 0x8a)
+	drawBox(screen, r, color)
+	put(screen, inBorder(color, "[#48dbfb::b]"+title+"[-::-]"), r.x+2, r.y, r.w-4)
 }
 
 // drawSOC draws the console into the zoomed alerts panel. Returns the

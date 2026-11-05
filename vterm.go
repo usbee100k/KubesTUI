@@ -527,9 +527,16 @@ func glyphStyle(g vt10x.Glyph) tcell.Style {
 		// so reverse video also works on default-colored text.
 		fg, bg = bg, fg
 	}
+	fgc, bgc := vtColor(fg), vtColor(bg)
+	if fg == vt10x.DefaultFG || fg == vt10x.DefaultBG {
+		fgc = map[bool]tcell.Color{true: textColor, false: bgColor}[fg == vt10x.DefaultFG]
+	}
+	if bg == vt10x.DefaultBG || bg == vt10x.DefaultFG {
+		bgc = map[bool]tcell.Color{true: bgColor, false: textColor}[bg == vt10x.DefaultBG]
+	}
 	return tcell.StyleDefault.
-		Foreground(vtColor(fg)).
-		Background(vtColor(bg)).
+		Foreground(fgc).
+		Background(bgc).
 		Reverse(reverse).
 		Bold(g.Mode&vtAttrBold != 0).
 		Underline(g.Mode&vtAttrUnderline != 0).

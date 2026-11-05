@@ -198,10 +198,10 @@ func (fm *fileManager) setFooter() {
 func (fm *fileManager) focus(i int) {
 	fm.active = i
 	for j, p := range fm.panes {
-		color := tcell.ColorGray
-		style := tcell.StyleDefault.Background(tcell.ColorDarkSlateGray).Foreground(tcell.ColorWhite)
+		color := borderColor
+		style := tcell.StyleDefault.Background(panelColor).Foreground(textColor)
 		if j == i {
-			color = tcell.ColorAqua
+			color = borderFocusColor
 			style = tcell.StyleDefault.Background(tcell.ColorAqua).Foreground(tcell.ColorBlack)
 		}
 		p.box.SetBorderColor(color)

@@ -418,9 +418,9 @@ func (c *commandCenter) drawSlot(screen tcell.Screen, s ccSlot) {
 		return
 	}
 	act := c.active(s)
-	color := tcell.ColorGray
+	color := borderColor
 	if act == c.focus {
-		color = tcell.ColorAqua
+		color = borderFocusColor
 	}
 	drawBox(screen, s.r, color)
 
@@ -442,14 +442,14 @@ func (c *commandCenter) drawSlot(screen tcell.Screen, s ccSlot) {
 		if tx+width > s.r.x+s.r.w-2 {
 			break
 		}
-		put(screen, "┤"+label+"├", tx, s.r.y, width)
+		put(screen, inBorder(color, label), tx, s.r.y, width)
 		hit.tabs = append(hit.tabs, ccTabHit{tx, tx + width, p})
 		tx += width
 	}
 	if info := c.titleInfo(act); info != "" {
 		iw := tview.TaggedStringWidth(info) + 2
 		if ix := s.r.x + s.r.w - 2 - iw; ix > tx+1 {
-			put(screen, "┤"+info+"├", ix, s.r.y, iw)
+			put(screen, inBorder(color, info), ix, s.r.y, iw)
 		}
 	}
 
@@ -2060,8 +2060,8 @@ func (c *commandCenter) drawOverlay(screen tcell.Screen, all ccRect) {
 	h := min(all.h-2, max(12, all.h*4/5))
 	r := ccRect{all.x + (all.w-w)/2, all.y + (all.h-h)/2, w, h}
 	clearRect(screen, r)
-	drawBox(screen, r, tcell.ColorAqua)
-	put(screen, "┤[white::b]"+tview.Escape(o.title)+"[-::-]├", r.x+2, r.y, r.w-4)
+	drawBox(screen, r, borderFocusColor)
+	put(screen, inBorder(borderFocusColor, "[white::b]"+tview.Escape(o.title)+"[-::-]"), r.x+2, r.y, r.w-4)
 	in := r.inner()
 	in = ccRect{in.x + 1, in.y, in.w - 2, in.h}
 	var lines []string

@@ -88,7 +88,7 @@ func (m modalLayer) MouseHandler() func(action tview.MouseAction, event *tcell.E
 
 func styleForm(form *tview.Form) {
 	form.SetLabelColor(tcell.ColorYellow).
-		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
+		SetFieldBackgroundColor(panelColor).
 		SetFieldTextColor(tcell.ColorWhite).
 		SetButtonBackgroundColor(tcell.ColorAqua).
 		SetButtonTextColor(tcell.ColorBlack).

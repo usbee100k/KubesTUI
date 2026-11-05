@@ -54,8 +54,8 @@ func showChoice(title, text string, buttons []string, done func(label string)) {
 	modal := tview.NewModal().
 		SetText(text).
 		AddButtons(buttons).
-		SetBackgroundColor(tcell.ColorDarkSlateGray).
-		SetTextColor(tcell.ColorWhite).
+		SetBackgroundColor(panelColor).
+		SetTextColor(textColor).
 		SetButtonBackgroundColor(tcell.ColorAqua).
 		SetButtonTextColor(tcell.ColorBlack)
 	modal.SetBorder(true).SetTitle(" " + title + " ")

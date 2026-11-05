@@ -2306,27 +2306,6 @@ func installerPath() string {
 	return envOr("HOMELABCD_INSTALL", "")
 }
 
-func useASCIIBorders() {
-	tview.Borders.Horizontal = '-'
-	tview.Borders.Vertical = '|'
-	tview.Borders.TopLeft = '+'
-	tview.Borders.TopRight = '+'
-	tview.Borders.BottomLeft = '+'
-	tview.Borders.BottomRight = '+'
-	tview.Borders.LeftT = '+'
-	tview.Borders.RightT = '+'
-	tview.Borders.TopT = '+'
-	tview.Borders.BottomT = '+'
-	tview.Borders.Cross = '+'
-
-	tview.Borders.HorizontalFocus = '-'
-	tview.Borders.VerticalFocus = '|'
-	tview.Borders.TopLeftFocus = '+'
-	tview.Borders.TopRightFocus = '+'
-	tview.Borders.BottomLeftFocus = '+'
-	tview.Borders.BottomRightFocus = '+'
-}
-
 func modeText() string {
 	if dryRun {
 		return "[green::b]SAFE-DRY-RUN[-::-]"
@@ -2431,7 +2410,7 @@ func main() {
 	}
 
 	loadCluster()
-	useASCIIBorders()
+	applyBorders()
 
 	app := tview.NewApplication()
 	if screen, err := tcell.NewScreen(); err == nil {
@@ -2439,12 +2418,13 @@ func main() {
 		uiScreen = screen
 	}
 	uiApp = app
+	app.SetAfterDrawFunc(shadeBorders)
+	startBorderFlow(app)
 	enableMouseLog(app)
 
 	// Not launched by homelabCD's install.sh: a workstation, unless this
 	// Linux machine is a cluster node, in which case ask (see mode.go).
 	if !nodeMode() {
-		useASCIIBorders()
 		switch startupMode(os.Args[1:]) {
 		case modeAsk:
 			chooseMode(app)

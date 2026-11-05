@@ -249,8 +249,8 @@ func newRunner(app *tview.Application, pages *tview.Pages, footer *tview.TextVie
 	r.input = tview.NewInputField().
 		SetLabel("  INPUT > ").
 		SetLabelColor(tcell.ColorAqua).
-		SetFieldBackgroundColor(tcell.ColorDefault).
-		SetFieldTextColor(tcell.ColorWhite)
+		SetFieldBackgroundColor(bgColor).
+		SetFieldTextColor(textColor)
 	r.input.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
 			r.send(r.input.GetText() + "\n")
@@ -260,9 +260,9 @@ func newRunner(app *tview.Application, pages *tview.Pages, footer *tview.TextVie
 
 	divider := tview.NewBox()
 	divider.SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
-		style := tcell.StyleDefault.Foreground(tcell.ColorGray)
+		style := uiStyle().Foreground(borderColor)
 		for i := x + 2; i < x+width-1; i++ {
-			screen.SetContent(i, y, '-', nil, style)
+			screen.SetContent(i, y, lines().h, nil, style)
 		}
 		return x, y, width, height
 	})
