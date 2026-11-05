@@ -261,6 +261,14 @@ var operations = []operation{
 			"${HOMELABCD_INSTALL} --run gitops-update",
 		},
 	},
+	{
+		Title: "Roll Back GitOps Change",
+		Desc:  "Something you changed in the GitOps repo broke the cluster? Pick the last good version from the list (default: undo the newest change); it is committed on top and pushed (history is kept, so you can roll the rollback back), then Argo CD re-reads the repo, stuck syncs are stopped and out-of-date apps are synced. Shows the apps until they settle.",
+		Op:    "rollback",
+		Commands: []string{
+			"${HOMELABCD_INSTALL} --run rollback",
+		},
+	},
 }
 
 const toggleTitle = "Toggle Dry-Run / Live"

@@ -231,7 +231,7 @@ func opSection(op string) string {
 		return secRemoteJoin
 	case "vpn-status", "vpn-setup", "torrent-vpn":
 		return secVPN
-	case "os-update", "update", "gitops-update":
+	case "os-update", "update", "rollback", "gitops-update":
 		return secUpdate
 	}
 	return secCluster

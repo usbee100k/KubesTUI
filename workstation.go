@@ -664,6 +664,7 @@ func (w *workstation) actions() map[string][]wsAction {
 			{title: "Update Operating System", desc: "apt update and apt upgrade -y on all nodes or the ones you pick, one at a time; then optional safe reboots", op: "os-update", confirm: true},
 			{title: "Update homelabCD and KubesTUI", desc: "Pull the latest homelabCD and rebuild KubesTUI on " + host + " (settings are kept)", op: "update", confirm: true},
 			{title: "Update GitOps Templates", desc: "Merge new homelabCD templates into your GitOps repo; your edits and settings are kept", op: "gitops-update", confirm: true},
+			{title: "Roll Back GitOps Change", desc: "A change in the GitOps repo broke something? Go back to an earlier version, push it and resync Argo CD", op: "rollback", confirm: true},
 			{title: "Update KubesTUI on This Computer", desc: "Build the newest KubesTUI on " + host + " and install it here (" + version + " now)", run: w.selfUpdate},
 		},
 		secRemoteJoin: {
