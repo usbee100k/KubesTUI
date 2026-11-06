@@ -21,11 +21,23 @@ package main
 //       text       = #f5e9e9   normal text
 //       flow       = 8         seconds per turn of the colours (0: still,
 //                              shaded top to bottom instead)
+//       banner_font = bubble       the banner's letters: bubble, graffiti,
+//                              bloody (spray-painted, with drips) or blocks
+//       banner_top, banner_mid, banner_bottom
+//                              the banner's colours, top to bottom
+//                              (default: border, border_mid, border_end),
+//                              e.g. #00f0ff, #6a8cff, #c62cff
 //
 //   KUBESTUI_BORDER_COLOR, _BORDER_MID_COLOR, _BORDER_END_COLOR,
 //   _BORDER_FOCUS_COLOR, _BORDER_FOCUS_MID_COLOR, _BORDER_FOCUS_END_COLOR,
 //   _BACKGROUND, _PANEL_COLOR, _TEXT_COLOR and _BORDER_FLOW (all
 //   KUBESTUI_...) override the file.
+//
+//       style      = standard  or sleek: the terminal's own background,
+//                              white thin borders (aqua on the focused
+//                              panel), no banner, no colour settings
+//                              ("Switch to Sleek/Standard Look" in the
+//                              Cluster tab toggles it; KUBESTUI_STYLE)
 //
 // The file is read at start: quit and reopen KubesTUI to see a change.
 // (In node mode kbtui runs as root, so the file there is /root/.kubestui/theme.)
@@ -35,6 +47,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -57,7 +70,11 @@ var (
 	textColor        = tcell.GetColor("#f5e9e9") // warm off-white
 
 	flowSeconds = 8.0 // one clockwise turn of the border colours
+
+	themeStyle = "standard" // or "sleek"
 )
+
+func sleekLook() bool { return themeStyle == "sleek" }
 
 func themePath() string { return filepath.Join(kubestuiDir(), "theme") }
 
@@ -81,6 +98,7 @@ func loadTheme() {
 		"border": &borderColor, "border_mid": &borderMidColor, "border_end": &borderEndColor,
 		"focus": &borderFocusColor, "focus_mid": &focusMidColor, "focus_end": &focusEndColor,
 		"background": &bgColor, "panel": &panelColor, "text": &textColor,
+		"banner_top": &bannerTop, "banner_mid": &bannerMid, "banner_bottom": &bannerBottom,
 	}
 	aliases := map[string]string{"gradient": "border_end", "border_focus": "focus",
 		"border_focus_mid": "focus_mid", "border_focus_end": "focus_end", "bg": "background"}
@@ -104,6 +122,10 @@ func loadTheme() {
 				set(dst, value)
 			} else if key == "flow" {
 				setFlow(value)
+			} else if key == "banner_font" {
+				setBannerFont(value)
+			} else if key == "style" {
+				setStyle(value)
 			}
 		}
 		f.Close()
@@ -124,6 +146,93 @@ func loadTheme() {
 	if focusEndColor == tcell.ColorDefault {
 		focusEndColor = borderFocusColor
 	}
+	setStyle(os.Getenv("KUBESTUI_STYLE"))
+
+	if sleekLook() {
+		borderColor, borderMidColor, borderEndColor = tcell.ColorWhite, tcell.ColorDefault, tcell.ColorWhite
+		borderFocusColor, focusMidColor, focusEndColor = tcell.ColorAqua, tcell.ColorDefault, tcell.ColorAqua
+		bgColor, panelColor, textColor = tcell.ColorDefault, tcell.ColorDarkSlateGray, tcell.ColorWhite
+		flowSeconds = 0
+	}
+}
+
+func setStyle(value string) {
+	switch strings.ToLower(strings.TrimSpace(strings.Trim(strings.TrimSpace(value), `"'`))) {
+	case "sleek":
+		themeStyle = "sleek"
+	case "standard":
+		themeStyle = "standard"
+	}
+}
+
+// saveThemeSetting sets key = value in the theme file, keeping its other
+// lines (and creating it if needed).
+func saveThemeSetting(key, value string) error {
+	var out []string
+	done := false
+	if data, err := os.ReadFile(themePath()); err == nil {
+		for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			if k, _, ok := strings.Cut(line, "="); ok && strings.EqualFold(strings.TrimSpace(k), key) {
+				if !done {
+					out = append(out, key+" = "+value)
+					done = true
+				}
+				continue
+			}
+			out = append(out, line)
+		}
+	}
+	if !done {
+		out = append(out, key+" = "+value)
+	}
+	if err := os.MkdirAll(kubestuiDir(), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(themePath(), []byte(strings.Join(out, "\n")+"\n"), 0o600)
+}
+
+// lookToggle is the menu item that switches between the two looks.
+func lookToggle() (title, desc string, run func()) {
+	to := "sleek"
+	title, desc = "Switch to Sleek Look", "Plain: your terminal's background, thin white borders, no banner (KubesTUI restarts)"
+	if sleekLook() {
+		to = "standard"
+		title, desc = "Switch to Standard Look", "The homelabCD look: banner, black-red background, flowing red-violet borders (KubesTUI restarts)"
+	}
+	return title, desc, func() {
+		if err := saveThemeSetting("style", to); err != nil {
+			showConfirm("LOOK", "Could not save the setting:\n"+err.Error(), "OK", "Close", func(bool) {})
+			return
+		}
+		restartRequested = true
+		uiApp.Stop()
+	}
+}
+
+// restartRequested: after the UI stops, start KubesTUI again (same
+// arguments and environment), e.g. to apply a new look.
+var restartRequested bool
+
+// relaunchIfRequested runs a fresh KubesTUI in this terminal and exits
+// with its status, when a restart was asked for.
+func relaunchIfRequested() {
+	if !restartRequested {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = os.Environ()
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // setFlow reads the seconds per turn ("off" or 0: no movement).
@@ -150,6 +259,9 @@ type borderLines struct {
 }
 
 func lines() borderLines {
+	if sleekLook() && !plainBorders() {
+		return borderLines{'─', '│', '╭', '╮', '╰', '╯', '├', '┤', '┬', '┴', '┼'}
+	}
 	if plainBorders() {
 		return borderLines{'─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼'}
 	}

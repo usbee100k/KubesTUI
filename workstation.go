@@ -230,8 +230,9 @@ func (w *workstation) buildHome() {
 
 	w.homeNote = tview.NewTextView().SetDynamicColors(true)
 
-	body := frame(dashboardTitle)
-	body.AddItem(intro, 5, 0, false).
+	body := &bannerFlex{Flex: frame(dashboardTitle()), banner: newBanner()}
+	body.AddItem(body.banner, 0, 0, false).
+		AddItem(intro, 5, 0, false).
 		AddItem(w.homeTable, 0, 1, true).
 		AddItem(w.homeNote, 2, 0, false)
 
@@ -566,9 +567,10 @@ func (w *workstation) buildCluster() {
 
 	w.menu = newTabbedMenu(w.clusterList, true)
 
-	body := &clusterBody{Flex: frame(dashboardTitle), top: tview.NewFlex(),
-		info: w.clusterInfo, lights: w.activity.view, lines: 2}
-	body.AddItem(nil, 1, 0, false).
+	body := &clusterBody{Flex: frame(dashboardTitle()), top: tview.NewFlex(),
+		info: w.clusterInfo, lights: w.activity.view, lines: 2, banner: newBanner()}
+	body.AddItem(body.banner, 0, 0, false).
+		AddItem(nil, 1, 0, false).
 		AddItem(body.top, 7, 0, false).
 		AddItem(nil, 1, 0, false).
 		AddItem(w.menu.bar, 2, 0, false).
@@ -590,6 +592,7 @@ type clusterBody struct {
 	top          *tview.Flex
 	info, lights tview.Primitive
 	lines        int // rows the lights want (activityPanel.onRefresh)
+	banner       *bannerView
 	layout       int // 0 not built yet, 1 side by side, 2 stacked
 }
 
@@ -619,12 +622,15 @@ func (c *clusterBody) Draw(screen tcell.Screen) {
 		}
 	}
 	c.ResizeItem(c.top, height, 0)
+	_, _, _, all := c.GetInnerRect()
+	c.ResizeItem(c.banner, c.banner.rows(width, all), 0)
 	c.Flex.Draw(screen)
 }
 
 // actions lists the cluster page's items by section.
 func (w *workstation) actions() map[string][]wsAction {
 	host := w.current.Host
+	lookTitle, lookDesc, lookRun := lookToggle()
 	var help []wsAction
 	for _, it := range helpMenuItems(w.showCluster) {
 		help = append(help, wsAction{title: it.title, desc: it.desc, run: it.run})
@@ -654,6 +660,7 @@ func (w *workstation) actions() map[string][]wsAction {
 			{title: "Import Docker Compose App", desc: "Deploy a docker-compose.yml from this computer into the cluster through GitOps", run: w.importCompose},
 			{title: "Change App Storage", desc: "Where an app keeps each folder: a Longhorn volume or a folder on a node's disk (also E in the Command Center's Storage panel)", op: "app-storage", confirm: true},
 			{title: "Remove Imported App", desc: "Remove an app imported from Docker Compose (and its data)", op: "compose-remove", confirm: true},
+			{title: lookTitle, desc: lookDesc, run: lookRun},
 			{title: "Back to Clusters", desc: "The list of clusters on this computer (ESC)", run: w.showHome},
 		},
 		secVPN: {

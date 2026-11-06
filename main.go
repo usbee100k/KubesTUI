@@ -2437,6 +2437,7 @@ func main() {
 		if err := app.Run(); err != nil {
 			panic(err)
 		}
+		relaunchIfRequested()
 		if launchNodeMenu {
 			openNodeMenu()
 		}
@@ -2501,6 +2502,8 @@ func main() {
 		bySection[secCluster] = append(bySection[secCluster], menuItem{title: op.Title, run: func() { showDetail(op) }})
 	}
 	bySection[secCluster] = append(bySection[secCluster], menuItem{title: toggleTitle + "  (D)", run: toggle})
+	lookTitle, _, lookRun := lookToggle()
+	bySection[secCluster] = append(bySection[secCluster], menuItem{title: lookTitle, run: lookRun})
 	menu := newTabbedMenu(list, false)
 	menu.setSections(sectionsFrom(bySection))
 	tabsCapture := list.GetInputCapture()
@@ -2518,7 +2521,8 @@ func main() {
 		AddItem(info, 36, 0, false).
 		AddItem(activity.view, 0, 1, false)
 
-	body := tview.NewFlex().SetDirection(tview.FlexRow).
+	body := &bannerFlex{Flex: tview.NewFlex().SetDirection(tview.FlexRow), banner: newBanner()}
+	body.AddItem(body.banner, 0, 0, false).
 		AddItem(nil, 1, 0, false).
 		AddItem(top, 6, 0, false).
 		AddItem(nil, 1, 0, false).
@@ -2648,4 +2652,5 @@ func main() {
 	if err := app.SetRoot(pages, true).EnableMouse(true).Run(); err != nil {
 		panic(err)
 	}
+	relaunchIfRequested()
 }

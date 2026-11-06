@@ -302,12 +302,18 @@ func readClusterName() string {
 
 // platformTitle is the border title of the node screens, named after the
 // cluster. Workstations manage several clusters and keep the generic title.
-// dashboardTitle heads the main screens.
-const dashboardTitle = "HOMELABCD KUBERNETES DASHBOARD"
+// dashboardTitle heads the main screens: the banner shows homelabCD in the
+// standard look, so only the sleek look has it in the title.
+func dashboardTitle() string {
+	if sleekLook() {
+		return "HOMELABCD KUBERNETES DASHBOARD"
+	}
+	return "KUBERNETES DASHBOARD"
+}
 
 func platformTitle() string {
 	if !nodeMode() || cluster.Name == "" {
-		return " " + dashboardTitle + " "
+		return " " + dashboardTitle() + " "
 	}
-	return " " + dashboardTitle + "  ·  " + strings.ToUpper(cluster.Name) + " "
+	return " " + dashboardTitle() + "  ·  " + strings.ToUpper(cluster.Name) + " "
 }

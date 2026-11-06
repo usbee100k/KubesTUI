@@ -132,7 +132,7 @@ func chooseMode(app *tview.Application) {
 	panel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(info, 0, 1, false).
 		AddItem(choices, 4, 0, true)
-	panel.SetBorder(true).SetTitle(" " + dashboardTitle + " ").SetTitleAlign(tview.AlignLeft)
+	panel.SetBorder(true).SetTitle(" " + dashboardTitle() + " ").SetTitleAlign(tview.AlignLeft)
 
 	height := 20
 	if !nodeReady {
